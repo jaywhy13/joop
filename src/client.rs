@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use crate::api::Report;
 
 /// Sends one status report to a running joop. This is what `joop report` does, and what
-/// the prompt tells each Pi session to run.
+/// the prompt tells each agent to run.
 pub fn send_report(api_url: &str, report: &Report) -> Result<String> {
     let endpoint = format!("{}/report", api_url.trim_end_matches('/'));
 

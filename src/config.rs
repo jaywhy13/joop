@@ -23,7 +23,7 @@ pub struct Cli {
 pub enum Command {
     /// Watch the repository and supervise agents (the default).
     Run(RunArgs),
-    /// Report a Pi session's status back to a running joop.
+    /// Report an agent's status back to a running joop.
     Report(ReportArgs),
     /// Print the current sessions and exit.
     Status(StatusArgs),

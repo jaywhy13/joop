@@ -37,7 +37,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// `joop report` — what each Pi session runs to check in.
+/// `joop report` — what each agent runs to check in.
 fn report(args: ReportArgs) -> Result<()> {
     let body = joop::client::send_report(
         &args.api_url,

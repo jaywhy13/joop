@@ -8,11 +8,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Where a Pi session has got to. `Dispatched` and `Stale` are set by joop itself;
-/// everything between is reported by the Pi session working the issue.
+/// Where an agent has got to. `Dispatched`, `Stale` and `Dead` are set by joop itself;
+/// everything between is reported by the agent working the issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    /// joop opened the tab; Pi has not checked in yet.
+    /// joop opened the tab; the agent has not checked in yet.
     Dispatched,
     Started,
     Working,
@@ -22,9 +22,9 @@ pub enum Status {
     /// The agent's pull request has landed. joop closes its tab.
     Merged,
     Failed,
-    /// Pi missed its heartbeat deadline but is still inside the grace period.
+    /// The agent missed its heartbeat deadline but is still inside the grace period.
     Stale,
-    /// Pi went quiet for so long that joop gave up on it, closed its tab and
+    /// The agent went quiet for so long that joop gave up on it, closed its tab and
     /// queued the issue for another agent.
     Dead,
 }
@@ -114,10 +114,10 @@ impl FromStr for Status {
     }
 }
 
-/// How often joop expects to hear from a Pi session.
+/// How often joop expects to hear from an agent.
 #[derive(Debug, Clone, Copy)]
 pub struct HeartbeatPolicy {
-    /// Grace period between opening the tab and Pi's first report.
+    /// Grace period between opening the tab and the agent's first report.
     pub first_update: Duration,
     /// Maximum gap between subsequent reports.
     pub subsequent_updates: Duration,
@@ -164,7 +164,7 @@ impl HeartbeatPolicy {
     }
 }
 
-/// Everything joop knows about one issue it handed to Pi.
+/// Everything joop knows about one issue it handed to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub repo: String,
@@ -345,7 +345,7 @@ impl State {
         self.persist_or_restore(&id, previous)
     }
 
-    /// Apply a report from a Pi session, which also counts as its heartbeat.
+    /// Apply a report from an agent, which also counts as its heartbeat.
     pub fn record_report(
         &mut self,
         repo: &str,

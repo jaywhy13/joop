@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::runner::{CommandRunner, Invocation};
 
-/// Provides each Pi session its own checkout, so two issues can be worked in parallel
+/// Provides each agent its own checkout, so two issues can be worked in parallel
 /// without fighting over one working tree.
 pub trait WorktreeProvider: Send + Sync {
     /// Directory the session should run in, creating the worktree and branch if needed.

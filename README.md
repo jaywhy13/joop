@@ -189,13 +189,23 @@ without starting the dashboard. In dashboard mode, logs go to `joop.log` next to
 | `--agent` | `claude` | Agent kind herdr starts in each tab |
 | `--agent-arg` | `--dangerously-skip-permissions` | Argument passed to the agent itself; repeatable |
 
+## Which herdr session joop drives
+
+joop shells out to `herdr`, which talks to whichever session `HERDR_SOCKET_PATH` points at,
+defaulting to `~/.config/herdr/herdr.sock`. So running joop inside a herdr pane drives that
+same session, and running it from an ordinary terminal drives the default one. Point
+`HERDR_SOCKET_PATH` at another session's socket (`herdr session list` prints them) to put
+joop's tabs somewhere else.
+
 ## A word on trust
 
 The label is the only gate. A `loop`-labelled issue's title and body go straight into the
-opening prompt of an agent that has a shell in a worktree of your repository, so **anyone who
-can label an issue in the watched repository can direct that agent**. joop passes the text as a
-single argument rather than through a shell, so there is no command injection, but prompt
-injection is inherent to the design. Watch repositories whose labels you control.
+opening prompt of an agent started as `claude --dangerously-skip-permissions`, in a worktree of
+your repository, so **anyone who can label an issue in the watched repository can direct an
+agent that will not stop to ask**. joop passes the text as a single argument rather than
+through a shell, so there is no command injection, but prompt injection is inherent to the
+design. Watch repositories whose labels you control, and change `--agent-arg` if you want the
+permission prompts back.
 
 ## Development
 
