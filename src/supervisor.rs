@@ -21,11 +21,14 @@ pub enum Task {
     Poll,
     Audit,
     CheckLimits,
+    CheckBlockers,
 }
 
 /// How often the heartbeat audit and the limit check run, independent of the issue poll.
 const AUDIT_EVERY: Duration = Duration::from_secs(30);
 const LIMIT_CHECK_EVERY: Duration = Duration::from_secs(60);
+/// How often waiting issues are judged, to see whether their blockers have landed.
+const BLOCKER_CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
 const TICK: Duration = Duration::from_millis(500);
 
 /// Decides which periodic jobs are due. Separated from the thread loop so the cadence
@@ -36,6 +39,7 @@ pub struct Schedule {
     last_poll: Instant,
     last_audit: Instant,
     last_limit_check: Instant,
+    last_blocker_check: Instant,
 }
 
 impl Schedule {
@@ -46,6 +50,7 @@ impl Schedule {
             last_poll: now,
             last_audit: now,
             last_limit_check: now,
+            last_blocker_check: now,
         }
     }
 
@@ -64,6 +69,10 @@ impl Schedule {
         if now.duration_since(self.last_poll) >= self.poll_every {
             self.last_poll = now;
             due.push(Task::Poll);
+        }
+        if now.duration_since(self.last_blocker_check) >= BLOCKER_CHECK_EVERY {
+            self.last_blocker_check = now;
+            due.push(Task::CheckBlockers);
         }
 
         due
@@ -154,6 +163,7 @@ fn run(engine: Arc<Engine>, poll_interval: Duration, inbox: Receiver<Request>) {
                 Task::Poll => poll(&engine),
                 Task::Audit => audit(&engine),
                 Task::CheckLimits => check_limits(&engine),
+                Task::CheckBlockers => check_blockers(&engine),
             }
         }
     }
@@ -169,6 +179,16 @@ fn poll(engine: &Engine) {
 fn audit(engine: &Engine) {
     if let Err(error) = engine.audit() {
         engine.log(Level::Error, format!("heartbeat audit failed: {error:#}"));
+    }
+}
+
+/// A failed judgement is logged by the engine and tried again next hour.
+fn check_blockers(engine: &Engine) {
+    if let Err(error) = engine.check_blockers() {
+        engine.log(
+            Level::Error,
+            format!("checking waiting issues failed: {error:#}"),
+        );
     }
 }
 
@@ -254,6 +274,29 @@ mod tests {
             schedule
                 .due(start + Duration::from_secs(1101))
                 .contains(&Task::Poll)
+        );
+    }
+
+    #[test]
+    fn waiting_issues_are_checked_once_an_hour() {
+        let (start, mut schedule) = schedule(Duration::from_secs(600));
+
+        assert!(
+            !schedule
+                .due(start + Duration::from_secs(3599))
+                .contains(&Task::CheckBlockers),
+            "not before the first hour is up"
+        );
+        assert!(
+            schedule
+                .due(start + Duration::from_secs(3600))
+                .contains(&Task::CheckBlockers)
+        );
+        assert!(
+            !schedule
+                .due(start + Duration::from_secs(3601))
+                .contains(&Task::CheckBlockers),
+            "and not again until the next hour"
         );
     }
 

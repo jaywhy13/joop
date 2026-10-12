@@ -136,7 +136,7 @@ pub struct ReportArgs {
     #[arg(long)]
     pub issue: u64,
 
-    /// One of: started, working, blocked, review, done, merged, failed.
+    /// One of: started, working, blocked, waiting, review, done, merged, failed.
     #[arg(long)]
     pub status: String,
 
@@ -148,6 +148,16 @@ pub struct ReportArgs {
     /// reporting `review`.
     #[arg(long)]
     pub pull_request: Option<String>,
+
+    /// Issue numbers this one cannot start until closed, comma separated. Required when
+    /// reporting `waiting`.
+    #[arg(long, value_delimiter = ',')]
+    pub blocked_by: Vec<u64>,
+
+    /// Issue numbers this agent's landed work has unblocked, comma separated. Only
+    /// meaningful with `merged` or `done`.
+    #[arg(long, value_delimiter = ',')]
+    pub unblocks: Vec<u64>,
 
     /// Base URL of the joop API.
     #[arg(long, env = "JOOP_API_URL", default_value = "http://127.0.0.1:7777")]
@@ -403,6 +413,44 @@ mod tests {
                 args.pull_request.as_deref(),
                 Some("https://github.com/jaywhy13/joop/pull/7")
             ),
+            other => panic!("expected a report command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_issues_an_agent_is_blocked_by_are_comma_separated() {
+        let cli = Cli::parse_from([
+            "joop",
+            "report",
+            "--issue",
+            "42",
+            "--status",
+            "waiting",
+            "--blocked-by",
+            "87,89",
+        ]);
+
+        match cli.command {
+            Some(Command::Report(args)) => assert_eq!(args.blocked_by, vec![87, 89]),
+            other => panic!("expected a report command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_issues_a_merge_unblocks_are_comma_separated() {
+        let cli = Cli::parse_from([
+            "joop",
+            "report",
+            "--issue",
+            "90",
+            "--status",
+            "merged",
+            "--unblocks",
+            "92,93",
+        ]);
+
+        match cli.command {
+            Some(Command::Report(args)) => assert_eq!(args.unblocks, vec![92, 93]),
             other => panic!("expected a report command, got {other:?}"),
         }
     }

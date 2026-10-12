@@ -93,9 +93,10 @@ Agents report with the CLI:
 joop report --issue 42 --status working --detail "writing the parser tests"
 ```
 
-Statuses an agent may send: `started`, `working`, `blocked`, `review`, `done`, `merged`,
-`failed`. joop sets `dispatched`, `stale` and `dead` itself, and rejects an agent that tries to
-claim one of those.
+Statuses an agent may send: `started`, `working`, `blocked`, `waiting`, `review`, `done`,
+`merged`, `failed`. `blocked` means a human is needed; `waiting` means other issues must land
+first (see [Blocked issues](#blocked-issues)). joop sets `dispatched`, `stale` and `dead` itself,
+and rejects an agent that tries to claim one of those.
 
 ### Pull requests
 
@@ -116,11 +117,43 @@ title:  #42 · PR #51
 tokens: issue=42  status=review  pull_request=51  pr_url=https://github.com/.../pull/51
 ```
 
-Reporting `merged` closes the tab, so an agent should make that its last action:
+An agent keeps listening for feedback on its pull request until it is merged or closed, so a
+session does not end while the pull request is still open. Reporting `merged` closes the tab, so
+an agent should make that its last action:
 
 ```sh
 joop report --issue 42 --status merged
 ```
+
+If the pull request is closed without merging, the agent reports `failed` with the reason.
+
+## Blocked issues
+
+Before an agent starts building, it checks the issue for a "Blocked by" list, and for work it
+cannot build without, and looks up each issue it names. If any of them is still open, the agent
+reports `waiting`, naming them, and stops:
+
+```sh
+joop report --issue 92 --status waiting --blocked-by 87,89 --detail "waiting on #87, #89"
+```
+
+joop then closes the tab and holds the issue. It is not handed to a new agent on each poll, so a
+held issue costs nothing while it waits. Releasing it is one of two things:
+
+- **A merge that unblocks it.** When an agent's merged work unblocks other issues, it names them,
+  and joop starts those straight away:
+
+  ```sh
+  joop report --issue 90 --status merged --unblocks 92,93
+  ```
+
+- **The hourly check.** Every hour joop asks a Claude model (`claude-haiku-5-5`, run through
+  `claude -p`) which held issues are no longer blocked. It gives the model each held issue's
+  description and the open or closed state of each blocker. Those the model releases are started.
+  The check is skipped while joop is paused on Claude limits, and a failed check leaves every issue
+  held until the next hour.
+
+Run `joop forget --issue 92` to hand a held issue out again without waiting for its blockers.
 
 A replacement agent is told it is attempt *n* and that the worktree may already hold partial
 work, so it reads `git status` and builds on what the dead agent left rather than starting over.

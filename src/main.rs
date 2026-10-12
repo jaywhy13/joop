@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use joop::api::{self, ApiContext, Report};
+use joop::blockers::{ClaudeJudge, JUDGE_MODEL};
 use joop::clock::{Clock, SystemClock};
 use joop::config::{Cli, Command, ForgetArgs, ReportArgs, RunArgs, StatusArgs};
 use joop::engine::{Engine, EngineSettings};
@@ -46,6 +47,8 @@ fn report(args: ReportArgs) -> Result<()> {
             status: args.status,
             detail: args.detail,
             pull_request: args.pull_request,
+            blocked_by: args.blocked_by,
+            unblocks: args.unblocks,
         },
     )?;
 
@@ -149,25 +152,28 @@ fn run(args: RunArgs) -> Result<()> {
         )))
     };
 
-    let engine = Arc::new(Engine::new(
-        EngineSettings {
-            repo: repo.clone(),
-            label: args.label.clone(),
-            skill_command: args.skill.clone(),
-            api_url: args.api_url(),
-            agent_kind: args.agent.clone(),
-            agent_args: args.agent_args.clone(),
-            policy,
-            limit_threshold,
-            max_attempts,
-        },
-        issues,
-        worktrees,
-        agents.clone(),
-        limits,
-        clock.clone(),
-        state.clone(),
-    ));
+    let engine = Arc::new(
+        Engine::new(
+            EngineSettings {
+                repo: repo.clone(),
+                label: args.label.clone(),
+                skill_command: args.skill.clone(),
+                api_url: args.api_url(),
+                agent_kind: args.agent.clone(),
+                agent_args: args.agent_args.clone(),
+                policy,
+                limit_threshold,
+                max_attempts,
+            },
+            issues,
+            worktrees,
+            agents.clone(),
+            limits,
+            clock.clone(),
+            state.clone(),
+        )
+        .with_judge(Arc::new(ClaudeJudge::new(SystemRunner, JUDGE_MODEL))),
+    );
 
     api::serve(
         args.api_address(),

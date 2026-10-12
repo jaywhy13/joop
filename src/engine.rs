@@ -1,16 +1,17 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 
+use crate::blockers::{BlockerJudge, WaitingIssue};
 use crate::clock::Clock;
 use crate::github::IssueSource;
 use crate::herdr::{AgentHost, AgentSpec, PaneMetadata};
 use crate::issue::Issue;
 use crate::limits::{LimitSnapshot, LimitWatcher};
 use crate::prompt::{Briefing, build_prompt};
-use crate::state::{Dispatch, HeartbeatPolicy, PullRequest, Session, State, Status};
+use crate::state::{Dispatch, HeartbeatPolicy, PullRequest, Session, State, Status, Update};
 use crate::worktree::{WorktreeProvider, branch_for};
 
 /// How many recent events the dashboard keeps.
@@ -88,6 +89,12 @@ pub struct Engine {
     worktrees: Arc<dyn WorktreeProvider>,
     agents: Arc<dyn AgentHost>,
     limits: Option<Arc<dyn LimitWatcher>>,
+    /// Judges whether waiting issues have been unblocked. Without one, waiting issues are
+    /// only released by an agent's report.
+    judge: Option<Arc<dyn BlockerJudge>>,
+    /// Issues whose start is in progress. The API thread and the hourly check can both ask
+    /// for the same issue, and a second start would orphan the first agent's tab.
+    unblocking: Mutex<BTreeSet<u64>>,
     clock: Arc<dyn Clock>,
     state: Arc<Mutex<State>>,
     observed: Mutex<Observed>,
@@ -103,8 +110,18 @@ impl crate::api::Reporter for Engine {
         status: Status,
         detail: Option<&str>,
         pull_request: Option<PullRequest>,
+        blocked_by: Vec<u64>,
+        unblocks: Vec<u64>,
     ) -> Result<()> {
-        Engine::record_report(self, issue_number, status, detail, pull_request)
+        Engine::record_report(
+            self,
+            issue_number,
+            status,
+            detail,
+            pull_request,
+            blocked_by,
+            unblocks,
+        )
     }
 
     fn sessions(&self) -> Vec<Session> {
@@ -119,6 +136,15 @@ struct Observed {
     pause: Option<Pause>,
     limits: Option<LimitSnapshot>,
     pending: Vec<PendingIssue>,
+}
+
+/// `#87, #89` for a list of issue numbers, for log lines.
+fn describe_issues(numbers: &[u64]) -> String {
+    numbers
+        .iter()
+        .map(|number| format!("#{number}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Take a lock, recovering from a panic in another thread rather than poisoning the
@@ -145,11 +171,19 @@ impl Engine {
             worktrees,
             agents,
             limits,
+            judge: None,
+            unblocking: Mutex::new(BTreeSet::new()),
             clock,
             state,
             observed: Mutex::new(Observed::default()),
             events: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Let joop ask a judge whether waiting issues have been unblocked.
+    pub fn with_judge(mut self, judge: Arc<dyn BlockerJudge>) -> Self {
+        self.judge = Some(judge);
+        self
     }
 
     pub fn settings(&self) -> &EngineSettings {
@@ -200,7 +234,7 @@ impl Engine {
         self.remember_pending(&unclaimed);
 
         for issue in &unclaimed {
-            match self.dispatch(issue) {
+            match self.dispatch(issue, 1) {
                 Ok(()) => self.forget_pending(issue.number),
                 Err(error) => self.log(
                     Level::Error,
@@ -340,13 +374,17 @@ impl Engine {
     }
 
     /// Apply an agent's report, then act on what it said: a pull request is pushed onto the
-    /// agent's herdr pane, and a merged one means the work has landed, so its tab closes.
+    /// agent's herdr pane, a merged one means the work has landed so its tab closes, a
+    /// waiting one means the agent has stopped on purpose, and any issues a landed change
+    /// unblocks are started straight away.
     pub fn record_report(
         &self,
         issue_number: u64,
         status: Status,
         detail: Option<&str>,
         pull_request: Option<PullRequest>,
+        blocked_by: Vec<u64>,
+        unblocks: Vec<u64>,
     ) -> Result<()> {
         if status == Status::Review && pull_request.is_none() {
             let already_known = lock(&self.state)
@@ -360,12 +398,28 @@ impl Engine {
             }
         }
 
+        if status == Status::Waiting && blocked_by.is_empty() {
+            bail!("reporting `waiting` means naming the issues it is blocked by, as --blocked-by");
+        }
+        if !blocked_by.is_empty() && status != Status::Waiting {
+            bail!("--blocked-by only goes with `waiting`");
+        }
+        if !unblocks.is_empty() && !matches!(status, Status::Merged | Status::Done) {
+            bail!(
+                "--unblocks only makes sense once work has landed, so report `merged` or `done` \
+                 with it"
+            );
+        }
+
         lock(&self.state).record_report(
             &self.settings.repo,
             issue_number,
-            status,
-            detail,
-            pull_request,
+            Update {
+                status,
+                detail,
+                pull_request,
+                blocked_by: blocked_by.clone(),
+            },
             self.clock.now(),
         )?;
 
@@ -390,6 +444,17 @@ impl Engine {
             );
         }
 
+        if status == Status::Waiting {
+            self.log(
+                Level::Info,
+                format!(
+                    "#{issue_number} is waiting on {}; closing its herdr tab until they land",
+                    describe_issues(&blocked_by)
+                ),
+            );
+            self.abandon_tab(&session.tab_id);
+        }
+
         if status == Status::Merged {
             let landed = session
                 .pull_request
@@ -401,6 +466,12 @@ impl Engine {
                 format!("#{issue_number}: {landed} merged; closing its herdr tab"),
             );
             self.abandon_tab(&session.tab_id);
+        }
+
+        for unblocked in &unblocks {
+            if self.blockers_have_landed(*unblocked) {
+                self.start_unblocked(*unblocked);
+            }
         }
 
         Ok(())
@@ -461,6 +532,177 @@ impl Engine {
         }
     }
 
+    /// Start an issue that was waiting on other work, now that they have landed. Issues
+    /// joop is not holding are left alone: an open labelled one is picked up by the next poll.
+    fn start_unblocked(&self, issue_number: u64) {
+        if self.is_paused() {
+            self.log(
+                Level::Info,
+                format!(
+                    "#{issue_number} is unblocked, but joop is paused; it will start on resume"
+                ),
+            );
+            return;
+        }
+
+        if !lock(&self.unblocking).insert(issue_number) {
+            return;
+        }
+
+        self.start_held(issue_number);
+        lock(&self.unblocking).remove(&issue_number);
+    }
+
+    fn start_held(&self, issue_number: u64) {
+        let waiting = lock(&self.state)
+            .session(&self.settings.repo, issue_number)
+            .filter(|session| session.status == Status::Waiting)
+            .cloned();
+
+        let Some(session) = waiting else {
+            self.log(
+                Level::Info,
+                format!("#{issue_number} is not waiting on anything, so there is nothing to start"),
+            );
+            return;
+        };
+
+        let issue = Issue {
+            number: session.issue_number,
+            title: session.issue_title.clone(),
+            url: session.issue_url.clone(),
+            body: session.issue_body.clone(),
+            labels: vec![self.settings.label.clone()],
+        };
+
+        // Keep the attempts already spent: waiting is not a failure, but a replacement is
+        // still counted against the same cap as every other agent on this issue.
+        match self.dispatch(&issue, session.attempts) {
+            Ok(()) => self.log(
+                Level::Info,
+                format!("#{issue_number} is unblocked; handing it to a new agent"),
+            ),
+            Err(error) => self.log(
+                Level::Error,
+                format!("could not start unblocked #{issue_number}: {error:#}"),
+            ),
+        }
+    }
+
+    /// Whether every issue a waiting issue is blocked by is now closed. A merge can name an
+    /// issue whose other blockers are still open, and starting it then would be premature.
+    fn blockers_have_landed(&self, issue_number: u64) -> bool {
+        let blocked_by = lock(&self.state)
+            .session(&self.settings.repo, issue_number)
+            .map(|session| session.blocked_by.clone())
+            .unwrap_or_default();
+
+        for blocker in blocked_by {
+            match self.issues.state_of(blocker) {
+                Ok(state) if state.open => {
+                    self.log(
+                        Level::Info,
+                        format!(
+                            "#{issue_number} is still waiting on #{blocker}; not starting it yet"
+                        ),
+                    );
+                    return false;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.log(
+                        Level::Warn,
+                        format!(
+                            "could not read #{blocker}, so #{issue_number} stays held: {error:#}"
+                        ),
+                    );
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Ask the judge which waiting issues have been unblocked, and start those. Does nothing
+    /// while joop is paused on Claude limits, since the judge is itself a Claude call.
+    pub fn check_blockers(&self) -> Result<()> {
+        let Some(judge) = &self.judge else {
+            return Ok(());
+        };
+        if self.is_paused() {
+            return Ok(());
+        }
+
+        let waiting = lock(&self.state).waiting();
+        if waiting.is_empty() {
+            return Ok(());
+        }
+
+        let mut held = Vec::with_capacity(waiting.len());
+        for session in &waiting {
+            let blockers = session
+                .blocked_by
+                .iter()
+                .map(|number| self.issues.state_of(*number))
+                .collect::<Result<Vec<_>>>();
+
+            match blockers {
+                Ok(blockers) => held.push(WaitingIssue {
+                    number: session.issue_number,
+                    title: session.issue_title.clone(),
+                    body: session.issue_body.clone(),
+                    blockers,
+                }),
+                // One unreadable blocker must not stop the others from being judged.
+                Err(error) => self.log(
+                    Level::Warn,
+                    format!(
+                        "could not read what #{} is waiting on, leaving it held: {error:#}",
+                        session.issue_number
+                    ),
+                ),
+            }
+        }
+
+        if held.is_empty() {
+            return Ok(());
+        }
+
+        let unblocked = match judge.unblocked(&held) {
+            Ok(unblocked) => unblocked,
+            Err(error) => {
+                self.log(
+                    Level::Warn,
+                    format!("could not check waiting issues, trying again next hour: {error:#}"),
+                );
+                return Ok(());
+            }
+        };
+
+        self.log(
+            Level::Info,
+            format!(
+                "checked {} waiting issue(s): {}",
+                held.len(),
+                if unblocked.is_empty() {
+                    "none unblocked".to_string()
+                } else {
+                    format!("{} unblocked", describe_issues(&unblocked))
+                }
+            ),
+        );
+
+        // Only the judge's answers about issues that really are waiting are acted on.
+        for number in unblocked {
+            if held.iter().any(|issue| issue.number == number) {
+                self.start_unblocked(number);
+            }
+        }
+
+        Ok(())
+    }
+
     fn remember_pending(&self, issues: &[Issue]) {
         lock(&self.observed).pending = issues
             .iter()
@@ -478,11 +720,11 @@ impl Engine {
     }
 
     /// Give one issue to a fresh agent.
-    fn dispatch(&self, issue: &Issue) -> Result<()> {
+    fn dispatch(&self, issue: &Issue, attempt: u32) -> Result<()> {
         let slug = issue.slug();
         let branch = branch_for(&slug);
         let worktree = self.worktrees.prepare(&slug, &branch)?;
-        let agent = self.start_agent(issue, &slug, &worktree, 1)?;
+        let agent = self.start_agent(issue, &slug, &worktree, attempt)?;
 
         let record = lock(&self.state).record_dispatch(Dispatch {
             repo: self.settings.repo.clone(),
@@ -496,7 +738,7 @@ impl Engine {
             branch,
             worktree,
             at: self.clock.now(),
-            attempt: 1,
+            attempt,
         });
 
         // An agent joop failed to record is an agent it cannot supervise, and the next
@@ -537,6 +779,7 @@ impl Engine {
         let prompt = build_prompt(&Briefing {
             issue,
             repo: &self.settings.repo,
+            label: &self.settings.label,
             skill_command: &self.settings.skill_command,
             api_url: &self.settings.api_url,
             policy: &self.settings.policy,
@@ -785,10 +1028,11 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
+    use crate::github::IssueState;
     use crate::herdr::{AgentHost, AgentSpec, PaneMetadata, RunningAgent};
     use crate::issue::Issue;
     use crate::limits::{LimitSnapshot, LimitWatcher};
-    use crate::state::{HeartbeatPolicy, PullRequest, State, Status};
+    use crate::state::{HeartbeatPolicy, PullRequest, State, Status, Update};
     use crate::worktree::WorktreeProvider;
     use chrono::{DateTime, Duration, TimeZone, Utc};
     use std::path::PathBuf;
@@ -809,26 +1053,56 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeIssues(Mutex<Vec<Issue>>);
+    struct FakeIssues {
+        issues: Mutex<Vec<Issue>>,
+        closed: Mutex<Vec<u64>>,
+        unreadable: Mutex<Vec<u64>>,
+    }
 
     impl FakeIssues {
         fn with(issues: Vec<Issue>) -> Self {
-            Self(Mutex::new(issues))
+            Self {
+                issues: Mutex::new(issues),
+                ..Self::default()
+            }
         }
         fn set(&self, issues: Vec<Issue>) {
-            *self.0.lock().unwrap() = issues;
+            *self.issues.lock().unwrap() = issues;
+        }
+        /// Mark an issue closed, as GitHub does when a pull request that closes it merges.
+        fn close(&self, number: u64) {
+            self.closed.lock().unwrap().push(number);
+        }
+        /// Make GitHub fail to read one issue, as it does for a mistyped number.
+        fn make_unreadable(&self, number: u64) {
+            self.unreadable.lock().unwrap().push(number);
         }
     }
 
     impl IssueSource for FakeIssues {
+        fn state_of(&self, number: u64) -> Result<IssueState> {
+            if self.unreadable.lock().unwrap().contains(&number) {
+                return Err(anyhow!("gh cannot read #{number}"));
+            }
+            Ok(IssueState {
+                number,
+                title: format!("issue {number}"),
+                open: !self.closed.lock().unwrap().contains(&number),
+            })
+        }
+
         fn labelled(&self, _label: &str) -> Result<Vec<Issue>> {
-            Ok(self.0.lock().unwrap().clone())
+            Ok(self.issues.lock().unwrap().clone())
         }
     }
 
     struct FailingIssues;
 
     impl IssueSource for FailingIssues {
+        fn state_of(&self, _number: u64) -> Result<IssueState> {
+            Err(anyhow!("gh is down"))
+        }
+
         fn labelled(&self, _label: &str) -> Result<Vec<Issue>> {
             anyhow::bail!("gh exploded")
         }
@@ -997,10 +1271,23 @@ mod tests {
         build_harness(
             Arc::new(FakeIssues::with(issues)),
             Arc::new(FakeLimits::at(0.1, None)),
+            None,
         )
     }
 
-    fn build_harness(issues: Arc<FakeIssues>, limits: Arc<FakeLimits>) -> Harness {
+    fn harness_with_judge(issues: Vec<Issue>, judge: Arc<FakeJudge>) -> Harness {
+        build_harness(
+            Arc::new(FakeIssues::with(issues)),
+            Arc::new(FakeLimits::at(0.1, None)),
+            Some(judge),
+        )
+    }
+
+    fn build_harness(
+        issues: Arc<FakeIssues>,
+        limits: Arc<FakeLimits>,
+        judge: Option<Arc<FakeJudge>>,
+    ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(Mutex::new(
             State::load(&dir.path().join("state.json")).unwrap(),
@@ -1028,6 +1315,10 @@ mod tests {
             clock.clone(),
             state.clone(),
         );
+        let engine = match judge {
+            Some(judge) => engine.with_judge(judge),
+            None => engine,
+        };
 
         Harness {
             engine,
@@ -1171,7 +1462,17 @@ mod tests {
             .state
             .lock()
             .unwrap()
-            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(5))
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Update {
+                    status: Status::Done,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(5),
+            )
             .unwrap();
 
         harness.engine.poll().unwrap();
@@ -1416,9 +1717,12 @@ mod tests {
                 .record_report(
                     "jaywhy13/joop",
                     42,
-                    Status::Working,
-                    Some("still going"),
-                    None,
+                    Update {
+                        status: Status::Working,
+                        detail: Some("still going"),
+                        pull_request: None,
+                        blocked_by: Vec::new(),
+                    },
                     harness.clock.now(),
                 )
                 .unwrap();
@@ -1498,7 +1802,17 @@ mod tests {
             .state
             .lock()
             .unwrap()
-            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(1))
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Update {
+                    status: Status::Done,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(1),
+            )
             .unwrap();
         harness.limits.set(0.95, Some(at(60)));
         harness.engine.check_limits().unwrap();
@@ -1536,6 +1850,7 @@ mod tests {
         let harness = build_harness(
             Arc::new(FakeIssues::with(vec![issue(42)])),
             Arc::new(FakeLimits::broken()),
+            None,
         );
 
         let result = harness.engine.check_limits();
@@ -1654,6 +1969,8 @@ mod tests {
                 Status::Review,
                 Some("opened for review"),
                 Some(pull_request()),
+                Vec::new(),
+                Vec::new(),
             )
             .unwrap();
 
@@ -1689,7 +2006,14 @@ mod tests {
 
         harness
             .engine
-            .record_report(42, Status::Review, None, Some(pull_request()))
+            .record_report(
+                42,
+                Status::Review,
+                None,
+                Some(pull_request()),
+                Vec::new(),
+                Vec::new(),
+            )
             .unwrap();
 
         let session = harness.engine.snapshot().sessions[0].clone();
@@ -1703,12 +2027,19 @@ mod tests {
         harness.engine.poll().unwrap();
         harness
             .engine
-            .record_report(42, Status::Review, None, Some(pull_request()))
+            .record_report(
+                42,
+                Status::Review,
+                None,
+                Some(pull_request()),
+                Vec::new(),
+                Vec::new(),
+            )
             .unwrap();
 
         harness
             .engine
-            .record_report(42, Status::Merged, None, None)
+            .record_report(42, Status::Merged, None, None, Vec::new(), Vec::new())
             .unwrap();
 
         assert_eq!(
@@ -1724,7 +2055,7 @@ mod tests {
         harness.engine.poll().unwrap();
         harness
             .engine
-            .record_report(42, Status::Merged, None, None)
+            .record_report(42, Status::Merged, None, None, Vec::new(), Vec::new())
             .unwrap();
 
         harness.clock.advance(Duration::minutes(500));
@@ -1745,7 +2076,14 @@ mod tests {
 
         harness
             .engine
-            .record_report(42, Status::Working, Some("writing tests"), None)
+            .record_report(
+                42,
+                Status::Working,
+                Some("writing tests"),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
             .unwrap();
 
         assert!(harness.herdr.closed.lock().unwrap().is_empty());
@@ -1758,7 +2096,7 @@ mod tests {
         assert!(
             harness
                 .engine
-                .record_report(99, Status::Working, None, None)
+                .record_report(99, Status::Working, None, None, Vec::new(), Vec::new())
                 .is_err()
         );
     }
@@ -1769,7 +2107,14 @@ mod tests {
         harness.engine.poll().unwrap();
         harness
             .engine
-            .record_report(42, Status::Review, None, Some(pull_request()))
+            .record_report(
+                42,
+                Status::Review,
+                None,
+                Some(pull_request()),
+                Vec::new(),
+                Vec::new(),
+            )
             .unwrap();
 
         harness.clock.advance(Duration::minutes(6));
@@ -1788,7 +2133,7 @@ mod tests {
         harness.engine.poll().unwrap();
         harness
             .engine
-            .record_report(42, Status::Working, None, None)
+            .record_report(42, Status::Working, None, None, Vec::new(), Vec::new())
             .unwrap();
 
         harness.clock.advance(Duration::minutes(6));
@@ -1899,5 +2244,298 @@ mod tests {
         }
 
         assert!(harness.engine.snapshot().events.len() <= MAX_EVENTS);
+    }
+
+    struct FakeJudge {
+        answer: Mutex<Result<Vec<u64>, String>>,
+        asked_about: Mutex<Vec<Vec<u64>>>,
+    }
+
+    impl FakeJudge {
+        fn answering(numbers: Vec<u64>) -> Arc<Self> {
+            Arc::new(Self {
+                answer: Mutex::new(Ok(numbers)),
+                asked_about: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                answer: Mutex::new(Err("the model is unavailable".into())),
+                asked_about: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked_about(&self) -> Vec<Vec<u64>> {
+            self.asked_about.lock().unwrap().clone()
+        }
+    }
+
+    impl BlockerJudge for FakeJudge {
+        fn unblocked(&self, waiting: &[WaitingIssue]) -> Result<Vec<u64>> {
+            self.asked_about
+                .lock()
+                .unwrap()
+                .push(waiting.iter().map(|issue| issue.number).collect());
+            match &*self.answer.lock().unwrap() {
+                Ok(numbers) => Ok(numbers.clone()),
+                Err(message) => Err(anyhow!("{message}")),
+            }
+        }
+    }
+
+    fn waiting_on(harness: &Harness, number: u64, blocked_by: Vec<u64>) {
+        harness
+            .engine
+            .record_report(
+                number,
+                Status::Waiting,
+                Some("blocked"),
+                None,
+                blocked_by,
+                Vec::new(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_waiting_agent_has_its_tab_closed_and_its_issue_held() {
+        let harness = harness(vec![issue(92)]);
+        harness.engine.poll().unwrap();
+
+        waiting_on(&harness, 92, vec![87]);
+        harness.engine.poll().unwrap();
+
+        assert_eq!(*harness.herdr.closed.lock().unwrap(), vec!["w4:t1"]);
+        assert_eq!(
+            harness.herdr.started_names().len(),
+            1,
+            "a held issue must not be handed to a fresh agent on the next poll"
+        );
+        assert_eq!(
+            harness
+                .state
+                .lock()
+                .unwrap()
+                .session("jaywhy13/joop", 92)
+                .unwrap()
+                .status,
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn a_waiting_report_must_name_what_it_is_blocked_by() {
+        let harness = harness(vec![issue(92)]);
+        harness.engine.poll().unwrap();
+
+        let result =
+            harness
+                .engine
+                .record_report(92, Status::Waiting, None, None, Vec::new(), Vec::new());
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn blocked_by_only_goes_with_a_waiting_report() {
+        let harness = harness(vec![issue(92)]);
+        harness.engine.poll().unwrap();
+
+        let result =
+            harness
+                .engine
+                .record_report(92, Status::Working, None, None, vec![87], Vec::new());
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unblocks_only_goes_with_landed_work() {
+        let harness = harness(vec![issue(90)]);
+        harness.engine.poll().unwrap();
+
+        let result =
+            harness
+                .engine
+                .record_report(90, Status::Working, None, None, Vec::new(), vec![92]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_merge_that_unblocks_a_waiting_issue_starts_it_straight_away() {
+        let harness = harness(vec![issue(90), issue(92)]);
+        harness.engine.poll().unwrap();
+        waiting_on(&harness, 92, vec![90]);
+        harness.issues.close(90);
+
+        harness
+            .engine
+            .record_report(
+                90,
+                Status::Merged,
+                None,
+                Some(pull_request()),
+                Vec::new(),
+                vec![92],
+            )
+            .unwrap();
+
+        let started = harness.herdr.started_names();
+        assert_eq!(
+            started.iter().filter(|name| *name == "issue-92").count(),
+            2,
+            "the held issue gets a fresh agent, got: {started:?}"
+        );
+        assert_eq!(
+            harness
+                .state
+                .lock()
+                .unwrap()
+                .session("jaywhy13/joop", 92)
+                .unwrap()
+                .status,
+            Status::Dispatched
+        );
+    }
+
+    #[test]
+    fn an_unblock_for_an_issue_joop_is_not_holding_starts_nothing() {
+        let harness = harness(vec![issue(42), issue(43)]);
+        harness.engine.poll().unwrap();
+
+        harness
+            .engine
+            .record_report(42, Status::Done, None, None, Vec::new(), vec![43])
+            .unwrap();
+
+        assert_eq!(
+            harness.herdr.started_names(),
+            vec!["issue-42", "issue-43"],
+            "issue 43 was dispatched by the poll already and is not waiting, so nothing new starts"
+        );
+    }
+
+    #[test]
+    fn the_judge_starts_only_the_waiting_issues_it_releases() {
+        let judge = FakeJudge::answering(vec![92, 999]);
+        let harness = harness_with_judge(vec![issue(42), issue(92), issue(93)], judge.clone());
+        harness.engine.poll().unwrap();
+        waiting_on(&harness, 92, vec![42]);
+        waiting_on(&harness, 93, vec![42]);
+
+        harness.engine.check_blockers().unwrap();
+
+        assert_eq!(judge.asked_about(), vec![vec![92, 93]]);
+        let started = harness.herdr.started_names();
+        assert_eq!(
+            started.iter().filter(|name| *name == "issue-92").count(),
+            2,
+            "92 is released by the judge, got: {started:?}"
+        );
+        assert_eq!(
+            started.iter().filter(|name| *name == "issue-93").count(),
+            1,
+            "93 stays held, got: {started:?}"
+        );
+    }
+
+    #[test]
+    fn the_judge_is_not_asked_when_nothing_is_waiting() {
+        let judge = FakeJudge::answering(vec![]);
+        let harness = harness_with_judge(vec![issue(42)], judge.clone());
+        harness.engine.poll().unwrap();
+
+        harness.engine.check_blockers().unwrap();
+
+        assert!(judge.asked_about().is_empty());
+    }
+
+    #[test]
+    fn a_failed_judgement_keeps_the_issues_held_until_the_next_check() {
+        let judge = FakeJudge::failing();
+        let harness = harness_with_judge(vec![issue(42), issue(92)], judge.clone());
+        harness.engine.poll().unwrap();
+        waiting_on(&harness, 92, vec![42]);
+
+        harness.engine.check_blockers().unwrap();
+
+        assert_eq!(
+            harness.herdr.started_names(),
+            vec!["issue-42", "issue-92"],
+            "only the poll's two agents started; the failed judgement adds none"
+        );
+        assert_eq!(
+            harness
+                .state
+                .lock()
+                .unwrap()
+                .session("jaywhy13/joop", 92)
+                .unwrap()
+                .status,
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn the_judge_is_not_asked_while_joop_is_paused_on_claude_limits() {
+        let judge = FakeJudge::answering(vec![92]);
+        let harness = harness_with_judge(vec![issue(42), issue(92)], judge.clone());
+        harness.engine.poll().unwrap();
+        waiting_on(&harness, 92, vec![42]);
+        harness.limits.set(0.95, Some(at(60)));
+        harness.engine.check_limits().unwrap();
+
+        harness.engine.check_blockers().unwrap();
+
+        assert!(judge.asked_about().is_empty());
+    }
+
+    #[test]
+    fn a_merge_does_not_start_an_issue_whose_other_blocker_is_still_open() {
+        let harness = harness(vec![issue(89), issue(90), issue(92)]);
+        harness.engine.poll().unwrap();
+        waiting_on(&harness, 92, vec![90, 89]);
+        harness.issues.close(90);
+
+        harness
+            .engine
+            .record_report(
+                90,
+                Status::Merged,
+                None,
+                Some(pull_request()),
+                Vec::new(),
+                vec![92],
+            )
+            .unwrap();
+
+        let started = harness.herdr.started_names();
+        assert_eq!(
+            started.iter().filter(|name| *name == "issue-92").count(),
+            1,
+            "#89 is still open, so #92 must stay held, got: {started:?}"
+        );
+    }
+
+    #[test]
+    fn a_bad_blocker_number_does_not_stop_other_waiting_issues_being_judged() {
+        let judge = FakeJudge::answering(vec![93]);
+        let harness = harness_with_judge(vec![issue(42), issue(92), issue(93)], judge.clone());
+        harness.engine.poll().unwrap();
+        harness.issues.make_unreadable(999);
+        waiting_on(&harness, 92, vec![999]);
+        waiting_on(&harness, 93, vec![42]);
+
+        harness.engine.check_blockers().unwrap();
+
+        assert_eq!(judge.asked_about(), vec![vec![93]]);
+        let started = harness.herdr.started_names();
+        assert_eq!(
+            started.iter().filter(|name| *name == "issue-93").count(),
+            2,
+            "93 is released by the judge, got: {started:?}"
+        );
     }
 }

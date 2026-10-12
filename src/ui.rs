@@ -366,6 +366,7 @@ fn status_style(status: Status) -> Style {
         Status::Working | Status::Started => Style::new().fg(Color::Blue),
         Status::Dispatched => Style::new().fg(Color::Gray),
         Status::Blocked | Status::Stale => Style::new().fg(Color::Yellow),
+        Status::Waiting => Style::new().fg(Color::Magenta),
         Status::Failed | Status::Dead => Style::new().fg(Color::Red),
     }
 }
@@ -462,6 +463,7 @@ mod tests {
             status: Status::Review,
             detail: None,
             pull_request,
+            blocked_by: Vec::new(),
             dispatched_at: now(),
             last_update_at: None,
             attempts: 1,
@@ -531,6 +533,7 @@ mod tests {
             Status::Started,
             Status::Working,
             Status::Blocked,
+            Status::Waiting,
             Status::Review,
             Status::Done,
             Status::Merged,

@@ -17,6 +17,13 @@ pub struct Report {
     /// The pull request the agent has opened, as a number or a GitHub URL.
     #[serde(default)]
     pub pull_request: Option<String>,
+    /// Issues this one cannot start until closed. Only sent with `waiting`.
+    #[serde(default)]
+    pub blocked_by: Vec<u64>,
+    /// Issues that this agent's landed work has unblocked, so joop can start them. Only
+    /// sent with `merged` or `done`.
+    #[serde(default)]
+    pub unblocks: Vec<u64>,
 }
 
 /// What the API hands an agent's report to. Implemented by the engine, which also acts on
@@ -28,6 +35,8 @@ pub trait Reporter: Send + Sync {
         status: Status,
         detail: Option<&str>,
         pull_request: Option<PullRequest>,
+        blocked_by: Vec<u64>,
+        unblocks: Vec<u64>,
     ) -> anyhow::Result<()>;
 
     fn sessions(&self) -> Vec<Session>;
@@ -112,6 +121,8 @@ fn handle_report(context: &ApiContext, body: &str) -> ApiResponse {
         status,
         report.detail.as_deref(),
         pull_request,
+        report.blocked_by,
+        report.unblocks,
     ) {
         Ok(()) => ApiResponse::json(
             200,
@@ -198,6 +209,8 @@ mod tests {
         status: Status,
         detail: Option<String>,
         pull_request: Option<PullRequest>,
+        blocked_by: Vec<u64>,
+        unblocks: Vec<u64>,
     }
 
     #[derive(Default)]
@@ -222,6 +235,8 @@ mod tests {
             status: Status,
             detail: Option<&str>,
             pull_request: Option<PullRequest>,
+            blocked_by: Vec<u64>,
+            unblocks: Vec<u64>,
         ) -> anyhow::Result<()> {
             if self.unknown_issue {
                 anyhow::bail!("joop has no session for jaywhy13/joop#{issue_number}");
@@ -231,6 +246,8 @@ mod tests {
                 status,
                 detail: detail.map(str::to_string),
                 pull_request,
+                blocked_by,
+                unblocks,
             });
             Ok(())
         }
@@ -344,6 +361,54 @@ mod tests {
 
         assert_eq!(response.code, 200, "body: {}", response.body);
         assert_eq!(reporter.reports.lock().unwrap()[0].status, Status::Merged);
+    }
+
+    #[test]
+    fn a_waiting_report_carries_the_issues_it_is_blocked_by() {
+        let reporter = accepting();
+
+        let response = handle(
+            &context(reporter.clone()),
+            "POST",
+            "/report",
+            r#"{"issue":92,"status":"waiting","blocked_by":[87,89]}"#,
+        );
+
+        assert_eq!(response.code, 200, "body: {}", response.body);
+        let reports = reporter.reports.lock().unwrap();
+        assert_eq!(reports[0].status, Status::Waiting);
+        assert_eq!(reports[0].blocked_by, vec![87, 89]);
+    }
+
+    #[test]
+    fn a_merge_carries_the_issues_it_unblocks() {
+        let reporter = accepting();
+
+        let response = handle(
+            &context(reporter.clone()),
+            "POST",
+            "/report",
+            r#"{"issue":90,"status":"merged","unblocks":[92,93]}"#,
+        );
+
+        assert_eq!(response.code, 200, "body: {}", response.body);
+        let reports = reporter.reports.lock().unwrap();
+        assert_eq!(reports[0].unblocks, vec![92, 93]);
+        assert!(reports[0].blocked_by.is_empty());
+    }
+
+    #[test]
+    fn reports_without_dependencies_still_work() {
+        let reporter = accepting();
+
+        let response = handle(
+            &context(reporter.clone()),
+            "POST",
+            "/report",
+            r#"{"issue":42,"status":"working"}"#,
+        );
+
+        assert_eq!(response.code, 200, "body: {}", response.body);
     }
 
     #[test]

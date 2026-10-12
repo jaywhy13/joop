@@ -3,10 +3,21 @@ use anyhow::{Context, Result};
 use crate::issue::{Issue, parse_issue_list};
 use crate::runner::{CommandRunner, Invocation};
 
+/// Whether one issue is still open. Enough to tell whether it still blocks another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueState {
+    pub number: u64,
+    pub title: String,
+    pub open: bool,
+}
+
 /// Source of the issues joop should work on.
 pub trait IssueSource: Send + Sync {
     /// Open issues carrying `label`, newest-numbered first.
     fn labelled(&self, label: &str) -> Result<Vec<Issue>>;
+
+    /// The current state of one issue, open or closed.
+    fn state_of(&self, number: u64) -> Result<IssueState>;
 }
 
 /// Reads issues through the GitHub CLI, so joop inherits whatever `gh auth` is set up.
@@ -46,6 +57,23 @@ impl<R: CommandRunner> GhIssues<R> {
     }
 }
 
+impl<R: CommandRunner> GhIssues<R> {
+    fn view_invocation(&self, number: u64) -> Invocation {
+        Invocation::new(
+            "gh",
+            [
+                "issue",
+                "view",
+                &number.to_string(),
+                "--repo",
+                &self.repo,
+                "--json",
+                "number,title,state",
+            ],
+        )
+    }
+}
+
 impl<R: CommandRunner> IssueSource for GhIssues<R> {
     fn labelled(&self, label: &str) -> Result<Vec<Issue>> {
         let stdout = self
@@ -54,6 +82,28 @@ impl<R: CommandRunner> IssueSource for GhIssues<R> {
             .with_context(|| format!("could not list `{label}` issues in {}", self.repo))?;
 
         parse_issue_list(&stdout)
+    }
+
+    fn state_of(&self, number: u64) -> Result<IssueState> {
+        #[derive(serde::Deserialize)]
+        struct View {
+            number: u64,
+            title: String,
+            state: String,
+        }
+
+        let stdout = self
+            .runner
+            .run_checked(&self.view_invocation(number))
+            .with_context(|| format!("could not read #{number} in {}", self.repo))?;
+        let view: View = serde_json::from_str(&stdout)
+            .with_context(|| format!("could not parse #{number} as returned by `gh`"))?;
+
+        Ok(IssueState {
+            number: view.number,
+            title: view.title,
+            open: view.state == "OPEN",
+        })
     }
 }
 
@@ -114,6 +164,43 @@ mod tests {
             "gh issue list --repo jaywhy13/joop --label loop --state open --limit 50 \
              --json number,title,url,body,labels"
         );
+    }
+
+    #[test]
+    fn reads_one_issue_by_number_in_the_configured_repo() {
+        let runner = RecordingRunner::returning([CommandOutput::succeeded(
+            r#"{"number":87,"title":"Recipe import","state":"CLOSED"}"#,
+        )]);
+
+        let state = GhIssues::new(&runner, "jaywhy13/meal-planner", 50)
+            .state_of(87)
+            .unwrap();
+
+        assert_eq!(
+            runner.last_call().display(),
+            "gh issue view 87 --repo jaywhy13/meal-planner --json number,title,state"
+        );
+        assert_eq!(
+            state,
+            IssueState {
+                number: 87,
+                title: "Recipe import".into(),
+                open: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_open_issue_is_reported_as_open() {
+        let runner = RecordingRunner::returning([CommandOutput::succeeded(
+            r#"{"number":89,"title":"Typed failures","state":"OPEN"}"#,
+        )]);
+
+        let state = GhIssues::new(&runner, "jaywhy13/meal-planner", 50)
+            .state_of(89)
+            .unwrap();
+
+        assert!(state.open);
     }
 
     #[test]
