@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use joop::api::{self, ApiContext, Report};
 use joop::clock::{Clock, SystemClock};
-use joop::config::{Cli, Command, ReportArgs, RunArgs, StatusArgs};
+use joop::config::{Cli, Command, ForgetArgs, ReportArgs, RunArgs, StatusArgs};
 use joop::engine::{Engine, EngineSettings};
 use joop::github::{GhIssues, IssueSource, repo_in_dir, verify_repo};
 use joop::limits::{ClaudeLimits, LimitWatcher};
@@ -23,6 +23,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Some(Command::Report(args)) => report(args),
         Some(Command::Status(args)) => status(args),
+        Some(Command::Forget(args)) => forget(args),
         Some(Command::Run(args)) => run(args),
         None => run(cli.run),
     };
@@ -86,11 +87,32 @@ fn status(args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+/// `joop forget` — drop joop's record of an issue so it can be dispatched again.
+fn forget(args: ForgetArgs) -> Result<()> {
+    let path = args
+        .state_file
+        .unwrap_or_else(joop::config::default_state_path);
+    let repo = match args.repo {
+        Some(repo) => repo,
+        None => repo_in_dir(&SystemRunner, &std::env::current_dir()?)
+            .context("no repository given: pass --repo owner/name")?,
+    };
+
+    let mut state = State::load(&path)?;
+    if state.forget(&repo, args.issue)? {
+        println!("Forgot {repo}#{}; joop will pick it up again.", args.issue);
+    } else {
+        println!("joop has no record of {repo}#{}.", args.issue);
+    }
+    Ok(())
+}
+
 /// `joop` / `joop run` — watch the repository and supervise the agents.
 fn run(args: RunArgs) -> Result<()> {
     let policy = args.policy()?;
     let poll_interval = args.poll_interval()?;
     let limit_threshold = args.limit_threshold()?;
+    let max_attempts = args.max_attempts()?;
     let repo_path = args.canonical_repo_path()?;
     let state_path = args.state_path();
 
@@ -130,6 +152,7 @@ fn run(args: RunArgs) -> Result<()> {
             agent_command: vec![args.agent.clone()],
             policy,
             limit_threshold,
+            max_attempts,
         },
         issues,
         worktrees,
@@ -156,10 +179,12 @@ fn run(args: RunArgs) -> Result<()> {
             args.label,
             args.api_url()
         );
-        // The supervisor thread does the work; park this one until interrupted.
-        loop {
-            std::thread::park();
+        // The supervisor thread does the work. Watch that it is still alive rather than
+        // parking forever, so a crashed supervisor does not look like a healthy joop.
+        while supervisor.is_running() {
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
+        bail!("the joop supervisor stopped unexpectedly; see the log for the cause");
     }
 
     Dashboard::new(engine, tabs).run(&supervisor)?;

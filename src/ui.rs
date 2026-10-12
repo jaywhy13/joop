@@ -16,7 +16,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
-use crate::engine::{Engine, Level, Snapshot};
+use crate::engine::{Engine, Level, PendingIssue, Snapshot};
 use crate::state::{Session, Status};
 use crate::supervisor::Supervisor;
 use crate::zellij::TabHost;
@@ -80,6 +80,7 @@ impl Dashboard {
                     self.notice = Some("re-reading Claude usage…".into());
                 }
                 (KeyCode::Char('o'), _) | (KeyCode::Enter, _) => self.focus_selected(&snapshot),
+                (KeyCode::Char('f'), _) => self.forget_selected(&snapshot),
                 (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_selection(1, &snapshot),
                 (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.move_selection(-1, &snapshot),
                 _ => {}
@@ -110,14 +111,37 @@ impl Dashboard {
         };
     }
 
+    /// Drop joop's record of the selected issue, so a later poll hands it out again.
+    fn forget_selected(&mut self, snapshot: &Snapshot) {
+        let Some(session) = self.selected_session(snapshot) else {
+            return;
+        };
+        let issue_number = session.issue_number;
+
+        self.notice = match self.engine.forget(issue_number) {
+            Ok(true) => Some(format!(
+                "forgot #{issue_number}; it will be picked up again"
+            )),
+            Ok(false) => Some(format!("joop has no record of #{issue_number}")),
+            Err(error) => Some(format!("could not forget #{issue_number}: {error:#}")),
+        };
+    }
+
     fn selected_session<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Session> {
         snapshot.sessions.get(self.selected.selected().unwrap_or(0))
     }
 
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>, snapshot: &Snapshot) {
+        let pending_height = if snapshot.pending.is_empty() {
+            0
+        } else {
+            (snapshot.pending.len() as u16 + 2).min(6)
+        };
+
         let areas = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(6),
+            Constraint::Length(pending_height),
             Constraint::Length(8),
             Constraint::Length(1),
         ])
@@ -125,8 +149,11 @@ impl Dashboard {
 
         self.draw_header(frame, areas[0], snapshot);
         self.draw_sessions(frame, areas[1], snapshot);
-        self.draw_events(frame, areas[2], snapshot);
-        self.draw_keys(frame, areas[3]);
+        if pending_height > 0 {
+            draw_pending(frame, areas[2], &snapshot.pending);
+        }
+        self.draw_events(frame, areas[3], snapshot);
+        self.draw_keys(frame, areas[4]);
     }
 
     fn draw_header(&self, frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &Snapshot) {
@@ -282,12 +309,38 @@ impl Dashboard {
     fn draw_keys(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " p poll now · l check limits · ↑↓ select · o focus tab · q quit",
+                " p poll now · l check limits · ↑↓ select · o focus tab · f forget · q quit",
                 Style::new().fg(Color::DarkGray),
             ))),
             area,
         );
     }
+}
+
+/// Labelled issues joop has seen but not handed out, so nothing is silently dropped.
+fn draw_pending(frame: &mut ratatui::Frame<'_>, area: Rect, pending: &[PendingIssue]) {
+    let lines: Vec<Line<'_>> = pending
+        .iter()
+        .take(area.height.saturating_sub(2) as usize)
+        .map(|issue| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" #{} ", issue.number),
+                    Style::new().fg(Color::Yellow),
+                ),
+                Span::raw(truncate(&issue.title, 60)),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" waiting for an agent ({}) ", pending.len())),
+        ),
+        area,
+    );
 }
 
 fn tab_label(session: &Session) -> String {
@@ -349,6 +402,14 @@ pub fn truncate(text: &str, width: usize) -> String {
 }
 
 fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    // Without this, a panic anywhere in the draw loop leaves the terminal in raw mode
+    // on the alternate screen, with no prompt and no echo.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal_state();
+        previous(info);
+    }));
+
     enable_raw_mode().context("could not put the terminal into raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("could not open the dashboard screen")?;
@@ -356,10 +417,15 @@ fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 }
 
 fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    restore_terminal_state();
     terminal.show_cursor().ok();
     Ok(())
+}
+
+/// Put the terminal back the way it was found. Safe to call twice.
+fn restore_terminal_state() {
+    disable_raw_mode().ok();
+    execute!(io::stdout(), LeaveAlternateScreen).ok();
 }
 
 #[cfg(test)]

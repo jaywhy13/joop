@@ -27,6 +27,23 @@ pub enum Command {
     Report(ReportArgs),
     /// Print the current sessions and exit.
     Status(StatusArgs),
+    /// Forget an issue so that joop picks it up again on the next poll.
+    Forget(ForgetArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ForgetArgs {
+    /// The issue number to forget.
+    #[arg(long)]
+    pub issue: u64,
+
+    /// Repository the issue belongs to, as `owner/name`.
+    #[arg(long, env = "JOOP_REPO")]
+    pub repo: Option<String>,
+
+    /// Where joop keeps its state.
+    #[arg(long)]
+    pub state_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -91,6 +108,10 @@ pub struct RunArgs {
     #[arg(long, default_value = "pi")]
     pub agent: String,
 
+    /// How many agents may be given one issue before joop gives up on it.
+    #[arg(long, default_value_t = 3)]
+    pub max_attempts: u32,
+
     /// Most issues to consider in one poll.
     #[arg(long, default_value_t = 50)]
     pub issue_limit: u32,
@@ -154,6 +175,13 @@ impl RunArgs {
         Ok(std::time::Duration::from_secs(
             self.poll_interval as u64 * 60,
         ))
+    }
+
+    pub fn max_attempts(&self) -> Result<u32> {
+        if self.max_attempts < 1 {
+            bail!("--max-attempts must be at least 1");
+        }
+        Ok(self.max_attempts)
     }
 
     pub fn limit_threshold(&self) -> Result<f64> {
@@ -225,6 +253,20 @@ mod tests {
         assert_eq!(policy.subsequent_updates, Duration::minutes(20));
         assert_eq!(policy.dead_after, Duration::minutes(30));
         assert_eq!(args.poll_interval().unwrap().as_secs(), 600);
+        assert_eq!(args.max_attempts().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_zero_attempt_cap_is_rejected() {
+        assert!(run_args(&["--max-attempts", "0"]).max_attempts().is_err());
+    }
+
+    #[test]
+    fn forgetting_takes_an_issue_number() {
+        match Cli::parse_from(["joop", "forget", "--issue", "42"]).command {
+            Some(Command::Forget(args)) => assert_eq!(args.issue, 42),
+            other => panic!("expected a forget command, got {other:?}"),
+        }
     }
 
     #[test]

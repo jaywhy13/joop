@@ -95,12 +95,6 @@ impl<T: CommandRunner + ?Sized> CommandRunner for &T {
     }
 }
 
-impl<T: CommandRunner + ?Sized> CommandRunner for std::sync::Arc<T> {
-    fn run(&self, invocation: &Invocation) -> Result<CommandOutput> {
-        (**self).run(invocation)
-    }
-}
-
 /// Runs commands for real.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemRunner;

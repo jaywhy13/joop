@@ -162,6 +162,7 @@ mod tests {
                 issue_number: 42,
                 issue_title: "t".into(),
                 issue_url: "u".into(),
+                issue_body: "b".into(),
                 tab_name: "issue-42".into(),
                 tab_id: Some("7".into()),
                 branch: "joop/issue-42".into(),

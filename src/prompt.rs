@@ -1,4 +1,5 @@
 use crate::issue::Issue;
+use crate::state::HeartbeatPolicy;
 
 /// Everything a spawned agent needs to know: the issue, how to report back, and how
 /// often joop expects to hear from it.
@@ -10,12 +11,8 @@ pub struct Briefing<'a> {
     pub skill_command: &'a str,
     /// Base URL of joop's reporting API.
     pub api_url: &'a str,
-    /// Minutes allowed before the first report.
-    pub first_update_minutes: i64,
-    /// Minutes allowed between later reports.
-    pub update_interval_minutes: i64,
-    /// Minutes of silence after which joop reassigns the issue.
-    pub dead_after_minutes: i64,
+    /// The reporting deadlines the agent must meet.
+    pub policy: &'a HeartbeatPolicy,
     /// 1 for the first agent on this issue, 2 for a replacement, and so on.
     pub attempt: u32,
 }
@@ -27,11 +24,12 @@ pub fn build_prompt(briefing: &Briefing<'_>) -> String {
         repo,
         skill_command,
         api_url,
-        first_update_minutes,
-        update_interval_minutes,
-        dead_after_minutes,
+        policy,
         attempt,
     } = briefing;
+    let first_update_minutes = policy.first_update.num_minutes();
+    let update_interval_minutes = policy.subsequent_updates.num_minutes();
+    let dead_after_minutes = policy.dead_after.num_minutes();
 
     let mut prompt = format!(
         "{skill_command} Implement GitHub issue {repo}#{number}: {title}\n\nIssue URL: {url}",
@@ -88,15 +86,13 @@ mod tests {
         }
     }
 
-    fn briefing<'a>(issue: &'a Issue, attempt: u32) -> Briefing<'a> {
+    fn briefing<'a>(issue: &'a Issue, policy: &'a HeartbeatPolicy, attempt: u32) -> Briefing<'a> {
         Briefing {
             issue,
             repo: "jaywhy13/joop",
             skill_command: "/implement",
             api_url: "http://127.0.0.1:7777",
-            first_update_minutes: 2,
-            update_interval_minutes: 20,
-            dead_after_minutes: 30,
+            policy,
             attempt,
         }
     }
@@ -104,7 +100,7 @@ mod tests {
     #[test]
     fn leads_with_the_skill_command() {
         let issue = issue();
-        let prompt = build_prompt(&briefing(&issue, 1));
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
 
         assert!(
             prompt.starts_with("/implement "),
@@ -115,7 +111,7 @@ mod tests {
     #[test]
     fn carries_the_issue_number_title_url_and_body() {
         let issue = issue();
-        let prompt = build_prompt(&briefing(&issue, 1));
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
 
         assert!(prompt.contains("jaywhy13/joop#42"));
         assert!(prompt.contains("Add a --dry-run flag"));
@@ -128,7 +124,7 @@ mod tests {
         let mut issue = issue();
         issue.body = "   ".into();
 
-        let prompt = build_prompt(&briefing(&issue, 1));
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
 
         assert!(!prompt.contains("Issue body:"), "got: {prompt}");
     }
@@ -136,7 +132,7 @@ mod tests {
     #[test]
     fn spells_out_the_reporting_deadlines() {
         let issue = issue();
-        let prompt = build_prompt(&briefing(&issue, 1));
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
 
         assert!(prompt.contains("within 2 minutes"));
         assert!(prompt.contains("every 20 minutes"));
@@ -146,7 +142,7 @@ mod tests {
     #[test]
     fn gives_the_exact_command_for_reporting_back() {
         let issue = issue();
-        let prompt = build_prompt(&briefing(&issue, 1));
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
 
         assert!(
             prompt.contains("joop report --issue 42 --status <status>"),
@@ -158,7 +154,7 @@ mod tests {
     #[test]
     fn a_first_attempt_is_not_told_about_previous_work() {
         let issue = issue();
-        let prompt = build_prompt(&briefing(&issue, 1));
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
 
         assert!(!prompt.contains("attempt"), "got: {prompt}");
     }
@@ -166,7 +162,7 @@ mod tests {
     #[test]
     fn a_replacement_agent_is_told_to_build_on_the_partial_work() {
         let issue = issue();
-        let prompt = build_prompt(&briefing(&issue, 2));
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 2));
 
         assert!(prompt.contains("attempt 2"));
         assert!(prompt.contains("git status"));

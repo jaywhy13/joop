@@ -24,6 +24,13 @@ pub trait TabHost: Send + Sync {
     /// Close a tab by the id `open` returned.
     fn close(&self, tab_id: &str) -> Result<()>;
 
+    /// Close a tab by name, for when no id was recorded.
+    fn close_by_name(&self, tab_name: &str) -> Result<()>;
+
+    /// Name of the tab the user is looking at, so joop can put it back after
+    /// visiting other tabs.
+    fn current_tab_name(&self) -> Result<Option<String>>;
+
     /// Bring a tab to the foreground, without sending it any input.
     fn focus(&self, tab_name: &str) -> Result<()>;
 
@@ -105,6 +112,31 @@ impl<R: CommandRunner> TabHost for ZellijTabs<R> {
             .run_checked(&self.action(["close-tab-by-id", tab_id]))
             .with_context(|| format!("could not close Zellij tab {tab_id}"))?;
         Ok(())
+    }
+
+    fn close_by_name(&self, tab_name: &str) -> Result<()> {
+        // There is no close-tab-by-name, so focus it and close what is focused.
+        self.focus(tab_name)?;
+        self.runner
+            .run_checked(&self.action(["close-tab"]))
+            .with_context(|| format!("could not close the Zellij tab `{tab_name}`"))?;
+        Ok(())
+    }
+
+    fn current_tab_name(&self) -> Result<Option<String>> {
+        let stdout = self
+            .runner
+            .run_checked(&self.action(["current-tab-info", "--json"]))
+            .context("could not ask Zellij which tab is focused")?;
+
+        #[derive(serde::Deserialize)]
+        struct TabInfo {
+            name: Option<String>,
+        }
+
+        let info: TabInfo =
+            serde_json::from_str(&stdout).context("unexpected shape from current-tab-info")?;
+        Ok(info.name)
     }
 
     fn focus(&self, tab_name: &str) -> Result<()> {
@@ -238,6 +270,44 @@ mod tests {
                 "zellij --session joop action write-chars carry on",
                 "zellij --session joop action write 13",
             ]
+        );
+    }
+
+    #[test]
+    fn a_tab_with_no_recorded_id_is_closed_by_focusing_it_first() {
+        let runner = RecordingRunner::new();
+
+        ZellijTabs::new(&runner, "joop")
+            .close_by_name("issue-42")
+            .unwrap();
+
+        assert_eq!(
+            runner.command_lines(),
+            vec![
+                "zellij --session joop action go-to-tab-name issue-42",
+                "zellij --session joop action close-tab",
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_the_focused_tab_name() {
+        let runner = RecordingRunner::returning([CommandOutput::succeeded(
+            r#"{"position":0,"name":"issue-42","active":true}"#,
+        )]);
+
+        let name = ZellijTabs::new(&runner, "joop").current_tab_name().unwrap();
+
+        assert_eq!(name.as_deref(), Some("issue-42"));
+    }
+
+    #[test]
+    fn an_unnamed_focused_tab_reads_as_none() {
+        let runner = RecordingRunner::returning([CommandOutput::succeeded(r#"{"position":0}"#)]);
+
+        assert_eq!(
+            ZellijTabs::new(&runner, "joop").current_tab_name().unwrap(),
+            None
         );
     }
 

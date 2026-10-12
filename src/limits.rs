@@ -63,11 +63,6 @@ impl ClaudeLimits {
         }
     }
 
-    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = endpoint.into();
-        self
-    }
-
     /// Default location of Claude Code's credentials.
     pub fn default_credentials_path() -> PathBuf {
         home_dir().join(".claude").join(".credentials.json")

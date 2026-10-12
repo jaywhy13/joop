@@ -55,6 +55,7 @@ process supervisor.
 | `l` | Re-read Claude usage limits now |
 | `↑` `↓` / `j` `k` | Move between sessions |
 | `o` / `Enter` | Jump to the selected agent's Zellij tab |
+| `f` | Forget the selected issue, so a later poll hands it out again |
 | `q` / `Esc` | Quit (the agents keep running) |
 
 ## The reporting contract
@@ -66,6 +67,11 @@ Each agent is told, in its opening prompt, that reporting is mandatory:
 | First report after startup | 2 minutes | Marked `stale` on the dashboard |
 | Between later reports | 20 minutes | Marked `stale` on the dashboard |
 | Total silence | 30 minutes | Tab is closed and the issue goes to a fresh agent |
+
+An agent whose Zellij tab has disappeared is replaced at once rather than waiting out its
+heartbeat, since a tab that is gone is an agent that is not coming back. After
+`--max-attempts` agents (3 by default) have gone quiet on one issue, joop stops reassigning
+it and parks it as `failed` rather than cycling agents through it forever.
 
 Agents report with the CLI:
 
@@ -96,9 +102,24 @@ joop reads the same usage figures Claude Code's `/usage` shows, using the OAuth 
 `~/.claude/.credentials.json`. When the tightest limit passes `--limit-threshold` (90% by
 default), joop stops starting new work and shows when the limit resets.
 
+**While paused, the heartbeat clock stops.** The agents are out of capacity too, so holding
+them to a 20-minute reporting deadline would declare every one of them dead and close every
+tab — leaving nothing to resume. When capacity returns, each running agent is told to carry on
+and gets a fresh first-report window before it counts as late.
+
 > That usage endpoint is internal to Claude Code and undocumented. joop treats a reading it
 > cannot take as *unknown* rather than *exhausted*, so a change there degrades to "keep
 > working", never to a silent stall. Pass `--no-limit-checks` to skip it entirely.
+
+## Each issue is handled once
+
+joop dispatches an issue once. An open issue keeps its `loop` label after the work is done, so
+re-dispatching on status alone would open a new tab on every poll, forever. To hand the same
+issue out again, press `f` on the dashboard or run:
+
+```sh
+joop forget --issue 42
+```
 
 ## State
 
@@ -120,9 +141,18 @@ without starting the dashboard. In dashboard mode, logs go to `joop.log` next to
 | `--update-interval` | `20` | Minutes allowed between later reports |
 | `--dead-after` | `30` | Minutes of silence before an agent is replaced |
 | `--limit-threshold` | `0.9` | Claude usage fraction at which joop stands down |
+| `--max-attempts` | `3` | Agents allowed on one issue before joop parks it |
 | `--api-port` | `7777` | Port the reporting API listens on |
 | `--skill` | `/implement` | Skill the agent drives the work with |
 | `--agent` | `pi` | Agent binary run in each tab |
+
+## A word on trust
+
+The label is the only gate. A `loop`-labelled issue's title and body go straight into the
+opening prompt of an agent that has a shell in a worktree of your repository, so **anyone who
+can label an issue in the watched repository can direct that agent**. joop passes the text as a
+single argument rather than through a shell, so there is no command injection, but prompt
+injection is inherent to the design. Watch repositories whose labels you control.
 
 ## Development
 
