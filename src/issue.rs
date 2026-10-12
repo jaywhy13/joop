@@ -14,7 +14,8 @@ pub struct Issue {
 }
 
 impl Issue {
-    /// Stable identifier used for the branch, worktree directory and Zellij tab.
+    /// Stable identifier used for the branch, worktree directory, herdr tab label
+    /// and agent name.
     pub fn slug(&self) -> String {
         format!("issue-{}", self.number)
     }

@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::state::HeartbeatPolicy;
 
 /// joop watches a GitHub repository for issues labelled `loop` and gives each one to a
-/// Pi agent in its own Zellij tab, then supervises them.
+/// `claude` agent in its own herdr tab, then supervises them.
 #[derive(Debug, Parser)]
 #[command(name = "joop", version, about, long_about = None)]
 pub struct Cli {
@@ -23,7 +23,7 @@ pub struct Cli {
 pub enum Command {
     /// Watch the repository and supervise agents (the default).
     Run(RunArgs),
-    /// Report a Pi session's status back to a running joop.
+    /// Report an agent's status back to a running joop.
     Report(ReportArgs),
     /// Print the current sessions and exit.
     Status(StatusArgs),
@@ -60,9 +60,9 @@ pub struct RunArgs {
     #[arg(long, default_value = "loop")]
     pub label: String,
 
-    /// Zellij session the agent tabs are opened in.
+    /// herdr workspace the agent tabs are opened in.
     #[arg(long, default_value = "joop")]
-    pub session: String,
+    pub workspace: String,
 
     /// Where per-issue worktrees are created. Defaults to a sibling of --repo-path.
     #[arg(long)]
@@ -84,6 +84,11 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 20)]
     pub update_interval: i64,
 
+    /// Minutes allowed between reports once the agent has a pull request open, which is
+    /// also how often it is told to poll for reviews.
+    #[arg(long, default_value_t = 5)]
+    pub review_interval: i64,
+
     /// Minutes of silence after which an agent is declared dead and replaced.
     #[arg(long, default_value_t = 30)]
     pub dead_after: i64,
@@ -104,9 +109,13 @@ pub struct RunArgs {
     #[arg(long, default_value = "/implement")]
     pub skill: String,
 
-    /// The agent binary to run in each tab.
-    #[arg(long, default_value = "pi")]
+    /// Agent kind herdr should start in each tab.
+    #[arg(long, default_value = "claude")]
     pub agent: String,
+
+    /// Arguments passed to the agent binary itself. Repeat for more than one.
+    #[arg(long = "agent-arg", default_values_t = [String::from("--dangerously-skip-permissions")])]
+    pub agent_args: Vec<String>,
 
     /// How many agents may be given one issue before joop gives up on it.
     #[arg(long, default_value_t = 3)]
@@ -127,13 +136,18 @@ pub struct ReportArgs {
     #[arg(long)]
     pub issue: u64,
 
-    /// One of: started, working, blocked, review, done, failed.
+    /// One of: started, working, blocked, review, done, merged, failed.
     #[arg(long)]
     pub status: String,
 
     /// What the agent is doing, shown on joop's dashboard.
     #[arg(long)]
     pub detail: Option<String>,
+
+    /// The pull request this agent opened, as a number or a GitHub URL. Required when
+    /// reporting `review`.
+    #[arg(long)]
+    pub pull_request: Option<String>,
 
     /// Base URL of the joop API.
     #[arg(long, env = "JOOP_API_URL", default_value = "http://127.0.0.1:7777")]
@@ -149,7 +163,11 @@ pub struct StatusArgs {
 
 impl RunArgs {
     pub fn policy(&self) -> Result<HeartbeatPolicy> {
-        if self.first_update < 1 || self.update_interval < 1 || self.dead_after < 1 {
+        if self.first_update < 1
+            || self.update_interval < 1
+            || self.review_interval < 1
+            || self.dead_after < 1
+        {
             bail!("heartbeat intervals must be at least one minute");
         }
         if self.dead_after <= self.update_interval {
@@ -160,10 +178,19 @@ impl RunArgs {
                 self.update_interval
             );
         }
+        if self.dead_after <= self.review_interval {
+            bail!(
+                "--dead-after ({}m) must be longer than --review-interval ({}m), or an agent \
+                 watching a pull request dies before it can even be flagged late",
+                self.dead_after,
+                self.review_interval
+            );
+        }
 
         Ok(HeartbeatPolicy {
             first_update: Duration::minutes(self.first_update),
             subsequent_updates: Duration::minutes(self.update_interval),
+            review_updates: Duration::minutes(self.review_interval),
             dead_after: Duration::minutes(self.dead_after),
         })
     }
@@ -246,11 +273,13 @@ mod tests {
         let policy = args.policy().unwrap();
 
         assert_eq!(args.label, "loop");
-        assert_eq!(args.session, "joop");
+        assert_eq!(args.workspace, "joop");
         assert_eq!(args.skill, "/implement");
-        assert_eq!(args.agent, "pi");
+        assert_eq!(args.agent, "claude");
+        assert_eq!(args.agent_args, vec!["--dangerously-skip-permissions"]);
         assert_eq!(policy.first_update, Duration::minutes(2));
         assert_eq!(policy.subsequent_updates, Duration::minutes(20));
+        assert_eq!(policy.review_updates, Duration::minutes(5));
         assert_eq!(policy.dead_after, Duration::minutes(30));
         assert_eq!(args.poll_interval().unwrap().as_secs(), 600);
         assert_eq!(args.max_attempts().unwrap(), 3);
@@ -277,6 +306,18 @@ mod tests {
 
         assert!(
             format!("{error:#}").contains("--dead-after"),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_review_window_past_the_death_deadline_is_rejected() {
+        let error = run_args(&["--review-interval", "40", "--dead-after", "30"])
+            .policy()
+            .expect_err("an unreachable review deadline");
+
+        assert!(
+            format!("{error:#}").contains("--review-interval"),
             "got: {error:#}"
         );
     }
@@ -338,9 +379,37 @@ mod tests {
                 assert_eq!(args.status, "working");
                 assert_eq!(args.detail.as_deref(), Some("writing tests"));
                 assert_eq!(args.api_url, "http://127.0.0.1:7777");
+                assert_eq!(args.pull_request, None);
             }
             other => panic!("expected a report command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_pull_request_can_be_reported_alongside_a_status() {
+        let cli = Cli::parse_from([
+            "joop",
+            "report",
+            "--issue",
+            "42",
+            "--status",
+            "review",
+            "--pull-request",
+            "https://github.com/jaywhy13/joop/pull/7",
+        ]);
+
+        match cli.command {
+            Some(Command::Report(args)) => assert_eq!(
+                args.pull_request.as_deref(),
+                Some("https://github.com/jaywhy13/joop/pull/7")
+            ),
+            other => panic!("expected a report command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_review_interval_of_zero_is_rejected() {
+        assert!(run_args(&["--review-interval", "0"]).policy().is_err());
     }
 
     #[test]

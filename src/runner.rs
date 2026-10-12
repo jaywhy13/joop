@@ -67,7 +67,7 @@ impl CommandOutput {
 }
 
 /// Seam over process execution, so every adapter below can be tested on the exact
-/// command line it would have run rather than by running `gh`, `git` or `zellij`.
+/// command line it would have run rather than by running `gh`, `git` or `herdr`.
 pub trait CommandRunner: Send + Sync {
     fn run(&self, invocation: &Invocation) -> Result<CommandOutput>;
 

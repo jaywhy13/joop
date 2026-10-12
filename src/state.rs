@@ -8,21 +8,23 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Where a Pi session has got to. `Dispatched` and `Stale` are set by joop itself;
-/// everything between is reported by the Pi session working the issue.
+/// Where an agent has got to. `Dispatched`, `Stale` and `Dead` are set by joop itself;
+/// everything between is reported by the agent working the issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    /// joop opened the tab; Pi has not checked in yet.
+    /// joop opened the tab; the agent has not checked in yet.
     Dispatched,
     Started,
     Working,
     Blocked,
     Review,
     Done,
+    /// The agent's pull request has landed. joop closes its tab.
+    Merged,
     Failed,
-    /// Pi missed its heartbeat deadline but is still inside the grace period.
+    /// The agent missed its heartbeat deadline but is still inside the grace period.
     Stale,
-    /// Pi went quiet for so long that joop gave up on it, closed its tab and
+    /// The agent went quiet for so long that joop gave up on it, closed its tab and
     /// queued the issue for another agent.
     Dead,
 }
@@ -36,6 +38,7 @@ impl Status {
             Status::Blocked => "blocked",
             Status::Review => "review",
             Status::Done => "done",
+            Status::Merged => "merged",
             Status::Failed => "failed",
             Status::Stale => "stale",
             Status::Dead => "dead",
@@ -44,7 +47,7 @@ impl Status {
 
     /// Statuses joop expects no further heartbeats from.
     pub fn is_finished(&self) -> bool {
-        matches!(self, Status::Done | Status::Failed)
+        matches!(self, Status::Done | Status::Merged | Status::Failed)
     }
 
     /// True for statuses that mean an agent is still expected to be working.
@@ -52,7 +55,7 @@ impl Status {
         !self.is_finished() && *self != Status::Dead
     }
 
-    /// Statuses a Pi session is allowed to report.
+    /// Statuses an agent is allowed to report.
     pub fn reportable() -> &'static [Status] {
         &[
             Status::Started,
@@ -60,6 +63,7 @@ impl Status {
             Status::Blocked,
             Status::Review,
             Status::Done,
+            Status::Merged,
             Status::Failed,
         ]
     }
@@ -96,6 +100,7 @@ impl FromStr for Status {
             "blocked" => Ok(Status::Blocked),
             "review" => Ok(Status::Review),
             "done" => Ok(Status::Done),
+            "merged" => Ok(Status::Merged),
             "failed" => Ok(Status::Failed),
             "stale" => Ok(Status::Stale),
             "dead" => Ok(Status::Dead),
@@ -104,13 +109,15 @@ impl FromStr for Status {
     }
 }
 
-/// How often joop expects to hear from a Pi session.
+/// How often joop expects to hear from an agent.
 #[derive(Debug, Clone, Copy)]
 pub struct HeartbeatPolicy {
-    /// Grace period between opening the tab and Pi's first report.
+    /// Grace period between opening the tab and the agent's first report.
     pub first_update: Duration,
     /// Maximum gap between subsequent reports.
     pub subsequent_updates: Duration,
+    /// Maximum gap once a pull request is open, where the agent polls for reviews.
+    pub review_updates: Duration,
     /// Silence after which joop declares the agent dead, cleans up its tab and
     /// hands the issue to another agent.
     pub dead_after: Duration,
@@ -121,6 +128,7 @@ impl Default for HeartbeatPolicy {
         Self {
             first_update: Duration::minutes(2),
             subsequent_updates: Duration::minutes(20),
+            review_updates: Duration::minutes(5),
             dead_after: Duration::minutes(30),
         }
     }
@@ -130,8 +138,18 @@ impl HeartbeatPolicy {
     /// The instant by which this session must have reported again.
     pub fn deadline_for(&self, session: &Session) -> DateTime<Utc> {
         match session.last_heartbeat() {
-            Some(last) => last + self.subsequent_updates,
+            Some(last) => last + self.gap_allowed_for(session),
             None => session.baseline_at() + self.first_update,
+        }
+    }
+
+    /// An agent watching a pull request is told to look for reviews every few minutes, so
+    /// joop expects to hear from it on that rhythm rather than the slower working one.
+    fn gap_allowed_for(&self, session: &Session) -> Duration {
+        if session.is_watching_a_pull_request() {
+            self.review_updates
+        } else {
+            self.subsequent_updates
         }
     }
 
@@ -141,7 +159,7 @@ impl HeartbeatPolicy {
     }
 }
 
-/// Everything joop knows about one issue it handed to Pi.
+/// Everything joop knows about one issue it handed to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub repo: String,
@@ -151,14 +169,19 @@ pub struct Session {
     /// The issue description, kept so a replacement agent gets the full brief.
     #[serde(default)]
     pub issue_body: String,
-    /// Name of the Zellij tab running this session.
-    pub tab_name: String,
-    /// Zellij's own tab id, as returned by `zellij action new-tab`.
-    pub tab_id: Option<String>,
+    /// herdr's name for the agent, which is also its tab label, e.g. `issue-42`.
+    pub agent_name: String,
+    /// herdr tab id, e.g. `w4:t2`.
+    pub tab_id: String,
+    /// herdr pane id the agent occupies, e.g. `w4:p2`.
+    pub pane_id: String,
     pub branch: String,
     pub worktree: PathBuf,
     pub status: Status,
     pub detail: Option<String>,
+    /// The pull request the agent opened, once it has reported one.
+    #[serde(default)]
+    pub pull_request: Option<PullRequest>,
     pub dispatched_at: DateTime<Utc>,
     pub last_update_at: Option<DateTime<Utc>>,
     /// How many agents have been given this issue, including the current one.
@@ -195,10 +218,26 @@ impl Session {
         self.last_heartbeat().unwrap_or_else(|| self.baseline_at())
     }
 
+    /// True while this agent has a pull request open and is polling it for reviews. Keyed on
+    /// the pull request rather than the status, because `audit` overwrites `Review` with
+    /// `Stale` on the first miss, which would silently drop the faster rhythm.
+    pub fn is_watching_a_pull_request(&self) -> bool {
+        self.pull_request.is_some() && !self.status.is_finished()
+    }
+
     /// True once joop has given up on the agent and is waiting to reassign the issue.
     pub fn needs_reassignment(&self) -> bool {
         self.status == Status::Dead
     }
+}
+
+/// A pull request an agent has opened for its issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequest {
+    pub number: u64,
+    /// Known only when the agent reported a URL rather than a bare number.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// The facts joop records when it opens a tab for an issue.
@@ -209,8 +248,9 @@ pub struct Dispatch {
     pub issue_title: String,
     pub issue_url: String,
     pub issue_body: String,
-    pub tab_name: String,
-    pub tab_id: Option<String>,
+    pub agent_name: String,
+    pub tab_id: String,
+    pub pane_id: String,
     pub branch: String,
     pub worktree: PathBuf,
     pub at: DateTime<Utc>,
@@ -290,12 +330,14 @@ impl State {
             issue_title: dispatch.issue_title,
             issue_url: dispatch.issue_url,
             issue_body: dispatch.issue_body,
-            tab_name: dispatch.tab_name,
+            agent_name: dispatch.agent_name,
             tab_id: dispatch.tab_id,
+            pane_id: dispatch.pane_id,
             branch: dispatch.branch,
             worktree: dispatch.worktree,
             status: Status::Dispatched,
             detail: None,
+            pull_request: None,
             dispatched_at: dispatch.at,
             last_update_at: None,
             attempts: dispatch.attempt,
@@ -307,13 +349,14 @@ impl State {
         self.persist_or_restore(&id, previous)
     }
 
-    /// Apply a report from a Pi session, which also counts as its heartbeat.
+    /// Apply a report from an agent, which also counts as its heartbeat.
     pub fn record_report(
         &mut self,
         repo: &str,
         issue_number: u64,
         status: Status,
         detail: Option<&str>,
+        pull_request: Option<PullRequest>,
         at: DateTime<Utc>,
     ) -> Result<()> {
         let id = key(repo, issue_number);
@@ -324,6 +367,11 @@ impl State {
 
         session.status = status;
         session.detail = detail.map(str::to_string);
+        // An agent that reports a later status without repeating its pull request has not
+        // withdrawn it, so the one joop already knows about stands.
+        if pull_request.is_some() {
+            session.pull_request = pull_request;
+        }
         session.last_update_at = Some(at);
         self.persist_or_restore(&id, Some(previous))
     }
@@ -355,7 +403,7 @@ impl State {
         Ok(audit)
     }
 
-    /// Declare a session dead now, for instance because its Zellij tab has gone.
+    /// Declare a session dead now, for instance because its herdr tab has gone.
     /// Returns false when the session was not live to begin with.
     pub fn mark_dead(&mut self, repo: &str, issue_number: u64, reason: &str) -> Result<bool> {
         let id = key(repo, issue_number);
@@ -423,8 +471,9 @@ impl State {
         &mut self,
         repo: &str,
         issue_number: u64,
-        tab_name: String,
-        tab_id: Option<String>,
+        agent_name: String,
+        tab_id: String,
+        pane_id: String,
         at: DateTime<Utc>,
     ) -> Result<u32> {
         let id = key(repo, issue_number);
@@ -436,8 +485,9 @@ impl State {
         session.attempts += 1;
         session.status = Status::Dispatched;
         session.detail = None;
-        session.tab_name = tab_name;
+        session.agent_name = agent_name;
         session.tab_id = tab_id;
+        session.pane_id = pane_id;
         session.dispatched_at = at;
         session.last_update_at = None;
         session.resumed_at = None;
@@ -518,8 +568,9 @@ mod tests {
                 issue_title: format!("Issue {number}"),
                 issue_url: format!("https://github.com/jaywhy13/joop/issues/{number}"),
                 issue_body: format!("Body of issue {number}"),
-                tab_name: format!("issue-{number}"),
-                tab_id: Some("3".into()),
+                agent_name: format!("issue-{number}"),
+                tab_id: format!("w4:t{number}"),
+                pane_id: format!("w4:p{number}"),
                 branch: format!("joop/issue-{number}"),
                 worktree: format!("/tmp/worktrees/issue-{number}").into(),
                 at: at(0),
@@ -566,7 +617,7 @@ mod tests {
         // Read-only file: the write fails, the existing record must stand.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
 
-        let result = state.record_report("jaywhy13/joop", 42, Status::Done, Some("x"), at(1));
+        let result = state.record_report("jaywhy13/joop", 42, Status::Done, Some("x"), None, at(1));
 
         assert!(result.is_err());
         let session = state.session("jaywhy13/joop", 42).unwrap();
@@ -584,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dispatched_issue_is_remembered_with_its_zellij_tab() {
+    fn a_dispatched_issue_is_remembered_with_its_herdr_tab_and_pane() {
         let dir = tempfile::tempdir().unwrap();
         let path = state_path(&dir);
         let mut state = State::load(&path).unwrap();
@@ -593,8 +644,9 @@ mod tests {
 
         let reloaded = State::load(&path).unwrap();
         let session = reloaded.session("jaywhy13/joop", 42).expect("session");
-        assert_eq!(session.tab_name, "issue-42");
-        assert_eq!(session.tab_id.as_deref(), Some("3"));
+        assert_eq!(session.agent_name, "issue-42");
+        assert_eq!(session.tab_id, "w4:t42");
+        assert_eq!(session.pane_id, "w4:p42");
         assert_eq!(session.branch, "joop/issue-42");
         assert_eq!(session.status, Status::Dispatched);
     }
@@ -622,6 +674,7 @@ mod tests {
                 42,
                 Status::Working,
                 Some("writing tests"),
+                None,
                 at(1),
             )
             .unwrap();
@@ -641,7 +694,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::load(&state_path(&dir)).unwrap();
 
-        let result = state.record_report("jaywhy13/joop", 99, Status::Working, None, at(1));
+        let result = state.record_report("jaywhy13/joop", 99, Status::Working, None, None, at(1));
 
         assert!(result.is_err());
     }
@@ -662,7 +715,7 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Working, None, at(1))
+            .record_report("jaywhy13/joop", 42, Status::Working, None, None, at(1))
             .unwrap();
 
         let session = state.session("jaywhy13/joop", 42).unwrap();
@@ -675,7 +728,7 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Working, None, at(10))
+            .record_report("jaywhy13/joop", 42, Status::Working, None, None, at(10))
             .unwrap();
 
         let session = state.session("jaywhy13/joop", 42).unwrap();
@@ -753,7 +806,7 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Done, None, at(1))
+            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(1))
             .unwrap();
 
         let audit = state.audit(&HeartbeatPolicy::default(), at(500)).unwrap();
@@ -773,7 +826,7 @@ mod tests {
         state.audit(&HeartbeatPolicy::default(), at(3)).unwrap();
 
         state
-            .record_report("jaywhy13/joop", 42, Status::Working, None, at(4))
+            .record_report("jaywhy13/joop", 42, Status::Working, None, None, at(4))
             .unwrap();
 
         assert_eq!(
@@ -813,7 +866,8 @@ mod tests {
                 "jaywhy13/joop",
                 42,
                 "issue-42".into(),
-                Some("9".into()),
+                "w4:t9".into(),
+                "w4:p9".into(),
                 at(32),
             )
             .unwrap();
@@ -825,7 +879,8 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(session.status, Status::Dispatched);
-        assert_eq!(session.tab_id.as_deref(), Some("9"));
+        assert_eq!(session.tab_id, "w4:t9");
+        assert_eq!(session.pane_id, "w4:p9");
         assert_eq!(
             session.last_update_at, None,
             "the replacement starts with a clean slate"
@@ -845,7 +900,7 @@ mod tests {
         assert!(state.is_claimed("jaywhy13/joop", 42));
 
         state
-            .record_report("jaywhy13/joop", 42, Status::Done, None, at(1))
+            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(1))
             .unwrap();
 
         assert!(
@@ -882,7 +937,7 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Working, None, at(5))
+            .record_report("jaywhy13/joop", 42, Status::Working, None, None, at(5))
             .unwrap();
 
         let resumed = state.resume_live_sessions(at(300)).unwrap();
@@ -907,7 +962,7 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Done, None, at(1))
+            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(1))
             .unwrap();
 
         assert!(state.resume_live_sessions(at(300)).unwrap().is_empty());
@@ -936,7 +991,7 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Done, None, at(1))
+            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(1))
             .unwrap();
 
         assert!(
@@ -970,6 +1025,7 @@ mod tests {
             Status::Blocked,
             Status::Review,
             Status::Done,
+            Status::Merged,
             Status::Failed,
             Status::Stale,
             Status::Dead,
@@ -999,6 +1055,262 @@ mod tests {
         );
     }
 
+    fn pull_request() -> PullRequest {
+        PullRequest {
+            number: 7,
+            url: Some("https://github.com/jaywhy13/joop/pull/7".into()),
+        }
+    }
+
+    #[test]
+    fn a_reported_pull_request_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = state_path(&dir);
+        let mut state = State::load(&path).unwrap();
+        dispatched(&mut state, 42);
+
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Review,
+                Some("opened a pull request"),
+                Some(pull_request()),
+                at(5),
+            )
+            .unwrap();
+
+        let session = State::load(&path)
+            .unwrap()
+            .session("jaywhy13/joop", 42)
+            .unwrap()
+            .clone();
+        assert_eq!(session.pull_request, Some(pull_request()));
+    }
+
+    #[test]
+    fn a_later_report_without_a_pull_request_keeps_the_one_already_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 42);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Review,
+                None,
+                Some(pull_request()),
+                at(5),
+            )
+            .unwrap();
+
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Review,
+                Some("no reviews yet"),
+                None,
+                at(10),
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.session("jaywhy13/joop", 42).unwrap().pull_request,
+            Some(pull_request()),
+            "reporting progress is not withdrawing the pull request"
+        );
+    }
+
+    #[test]
+    fn an_agent_watching_a_pull_request_is_expected_every_five_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 42);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Review,
+                None,
+                Some(pull_request()),
+                at(10),
+            )
+            .unwrap();
+
+        let session = state.session("jaywhy13/joop", 42).unwrap();
+        assert_eq!(
+            HeartbeatPolicy::default().deadline_for(session),
+            at(15),
+            "an agent polling for reviews every five minutes can report on that rhythm"
+        );
+    }
+
+    #[test]
+    fn the_review_rhythm_survives_joop_overwriting_the_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 42);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Review,
+                None,
+                Some(pull_request()),
+                at(10),
+            )
+            .unwrap();
+
+        // joop itself rewrites Review to Stale on the first missed check-in.
+        state.audit(&HeartbeatPolicy::default(), at(16)).unwrap();
+        assert_eq!(
+            state.session("jaywhy13/joop", 42).unwrap().status,
+            Status::Stale
+        );
+
+        let session = state.session("jaywhy13/joop", 42).unwrap();
+        assert_eq!(
+            HeartbeatPolicy::default().deadline_for(session),
+            at(15),
+            "the agent is still polling its pull request every five minutes, so the deadline \
+             must not quietly revert to twenty just because joop relabelled the session"
+        );
+    }
+
+    #[test]
+    fn an_agent_blocked_on_a_review_keeps_the_review_rhythm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 42);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Review,
+                None,
+                Some(pull_request()),
+                at(10),
+            )
+            .unwrap();
+
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Blocked,
+                Some("waiting on a human"),
+                None,
+                at(12),
+            )
+            .unwrap();
+
+        let session = state.session("jaywhy13/joop", 42).unwrap();
+        assert_eq!(HeartbeatPolicy::default().deadline_for(session), at(17));
+    }
+
+    #[test]
+    fn a_finished_session_is_not_watching_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 42);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Merged,
+                None,
+                Some(pull_request()),
+                at(10),
+            )
+            .unwrap();
+
+        assert!(
+            !state
+                .session("jaywhy13/joop", 42)
+                .unwrap()
+                .is_watching_a_pull_request()
+        );
+    }
+
+    #[test]
+    fn an_agent_still_writing_code_keeps_the_slower_twenty_minute_rhythm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 42);
+        state
+            .record_report("jaywhy13/joop", 42, Status::Working, None, None, at(10))
+            .unwrap();
+
+        let session = state.session("jaywhy13/joop", 42).unwrap();
+        assert_eq!(HeartbeatPolicy::default().deadline_for(session), at(30));
+    }
+
+    #[test]
+    fn a_merged_pull_request_finishes_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 42);
+
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Merged,
+                None,
+                Some(pull_request()),
+                at(60),
+            )
+            .unwrap();
+
+        let session = state.session("jaywhy13/joop", 42).unwrap();
+        assert!(session.status.is_finished());
+        assert_eq!(session.status, Status::Merged);
+        assert!(
+            state
+                .audit(&HeartbeatPolicy::default(), at(500))
+                .unwrap()
+                .is_empty(),
+            "nothing more is expected from an agent whose work has landed"
+        );
+    }
+
+    #[test]
+    fn a_reassigned_issue_inherits_the_dead_agents_pull_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 42);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Review,
+                None,
+                Some(pull_request()),
+                at(5),
+            )
+            .unwrap();
+        state.audit(&HeartbeatPolicy::default(), at(40)).unwrap();
+
+        state
+            .record_reassignment(
+                "jaywhy13/joop",
+                42,
+                "issue-42".into(),
+                "w4:t9".into(),
+                "w4:p9".into(),
+                at(41),
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.session("jaywhy13/joop", 42).unwrap().pull_request,
+            Some(pull_request()),
+            "the replacement works the same branch, so it inherits the open pull request \
+             rather than orphaning it"
+        );
+    }
+
     #[test]
     fn statuses_round_trip_through_their_wire_names() {
         for (status, wire) in [
@@ -1008,6 +1320,7 @@ mod tests {
             (Status::Blocked, "blocked"),
             (Status::Review, "review"),
             (Status::Done, "done"),
+            (Status::Merged, "merged"),
             (Status::Failed, "failed"),
             (Status::Stale, "stale"),
             (Status::Dead, "dead"),
