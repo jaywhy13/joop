@@ -40,6 +40,7 @@ mod tests {
             issue: 42,
             status: "working".into(),
             detail: None,
+            pull_request: None,
         };
 
         // Port 1 is reserved and never listening.

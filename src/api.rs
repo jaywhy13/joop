@@ -1,20 +1,36 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::clock::Clock;
-use crate::state::{State, Status};
+use crate::state::{PullRequest, Session, Status};
 
-/// A status report from a Pi session.
+/// A status report from an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub issue: u64,
     pub status: String,
     #[serde(default)]
     pub detail: Option<String>,
+    /// The pull request the agent has opened, as a number or a GitHub URL.
+    #[serde(default)]
+    pub pull_request: Option<String>,
+}
+
+/// What the API hands an agent's report to. Implemented by the engine, which also acts on
+/// it — showing the pull request on the agent's herdr pane, closing the tab once merged.
+pub trait Reporter: Send + Sync {
+    fn record_report(
+        &self,
+        issue_number: u64,
+        status: Status,
+        detail: Option<&str>,
+        pull_request: Option<PullRequest>,
+    ) -> anyhow::Result<()>;
+
+    fn sessions(&self) -> Vec<Session>;
 }
 
 /// What the API sends back.
@@ -42,19 +58,14 @@ impl ApiResponse {
 
 /// Everything the API needs to serve a request.
 pub struct ApiContext {
-    pub state: Arc<Mutex<State>>,
-    pub repo: String,
-    pub clock: Arc<dyn Clock>,
+    pub reporter: Arc<dyn Reporter>,
 }
 
 /// Route and handle one request. Kept free of any HTTP machinery so it can be tested directly.
 pub fn handle(context: &ApiContext, method: &str, path: &str, body: &str) -> ApiResponse {
     match (method, path) {
         ("GET", "/health") => ApiResponse::json(200, serde_json::json!({"ok": true})),
-        ("GET", "/sessions") => match context.state.lock() {
-            Ok(state) => ApiResponse::json(200, state.sessions()),
-            Err(_) => ApiResponse::error(500, "joop state is poisoned"),
-        },
+        ("GET", "/sessions") => ApiResponse::json(200, context.reporter.sessions()),
         ("POST", "/report") => handle_report(context, body),
         ("POST", _) | ("GET", _) => {
             ApiResponse::error(404, format!("no route for {method} {path}"))
@@ -90,17 +101,25 @@ fn handle_report(context: &ApiContext, body: &str) -> ApiResponse {
         );
     }
 
-    let mut state = match context.state.lock() {
-        Ok(state) => state,
-        Err(_) => return ApiResponse::error(500, "joop state is poisoned"),
+    let pull_request = match report.pull_request.as_deref().map(parse_pull_request) {
+        Some(Ok(pull_request)) => Some(pull_request),
+        Some(Err(error)) => return ApiResponse::error(400, error),
+        None => None,
     };
 
-    match state.record_report(
-        &context.repo,
+    if status == Status::Review && pull_request.is_none() {
+        return ApiResponse::error(
+            400,
+            "reporting `review` means a pull request is open, so send its number or URL as \
+             `pull_request`",
+        );
+    }
+
+    match context.reporter.record_report(
         report.issue,
         status,
         report.detail.as_deref(),
-        context.clock.now(),
+        pull_request,
     ) {
         Ok(()) => ApiResponse::json(
             200,
@@ -108,6 +127,37 @@ fn handle_report(context: &ApiContext, body: &str) -> ApiResponse {
         ),
         Err(error) => ApiResponse::error(404, format!("{error:#}")),
     }
+}
+
+/// Accept either a bare number or a GitHub pull request URL, since an agent has the URL to
+/// hand and should not have to pick it apart.
+pub fn parse_pull_request(reported: &str) -> Result<PullRequest, String> {
+    let reported = reported.trim();
+
+    if let Ok(number) = reported.trim_start_matches('#').parse::<u64>() {
+        if number == 0 {
+            return Err("pull request numbers start at 1".into());
+        }
+        return Ok(PullRequest {
+            number,
+            url: String::new(),
+        });
+    }
+
+    let number = reported
+        .rsplit('/')
+        .next()
+        .and_then(|tail| tail.parse::<u64>().ok())
+        .ok_or_else(|| format!("could not read a pull request number from `{reported}`"))?;
+
+    if !reported.contains("/pull/") {
+        return Err(format!("`{reported}` is not a pull request URL"));
+    }
+
+    Ok(PullRequest {
+        number,
+        url: reported.to_string(),
+    })
 }
 
 /// Run the reporting API until the process exits.
@@ -150,101 +200,170 @@ pub fn serve(address: SocketAddr, context: ApiContext) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::FixedClock;
-    use crate::state::Dispatch;
-    use chrono::{TimeZone, Utc};
+    use std::sync::Mutex;
 
-    fn context(dir: &tempfile::TempDir) -> ApiContext {
-        let mut state = State::load(&dir.path().join("state.json")).unwrap();
-        state
-            .record_dispatch(Dispatch {
-                repo: "jaywhy13/joop".into(),
-                issue_number: 42,
-                issue_title: "t".into(),
-                issue_url: "u".into(),
-                issue_body: "b".into(),
-                tab_name: "issue-42".into(),
-                tab_id: Some("7".into()),
-                branch: "joop/issue-42".into(),
-                worktree: "/worktrees/issue-42".into(),
-                at: Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap(),
-                attempt: 1,
-            })
-            .unwrap();
+    /// One report as the API passed it on.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedReport {
+        issue_number: u64,
+        status: Status,
+        detail: Option<String>,
+        pull_request: Option<PullRequest>,
+    }
 
-        ApiContext {
-            state: Arc::new(Mutex::new(state)),
-            repo: "jaywhy13/joop".into(),
-            clock: Arc::new(FixedClock::new(
-                Utc.with_ymd_and_hms(2026, 10, 11, 12, 5, 0).unwrap(),
-            )),
+    #[derive(Default)]
+    struct RecordingReporter {
+        reports: Mutex<Vec<RecordedReport>>,
+        unknown_issue: bool,
+    }
+
+    impl RecordingReporter {
+        fn rejecting_unknown_issues() -> Self {
+            Self {
+                reports: Mutex::new(Vec::new()),
+                unknown_issue: true,
+            }
         }
+    }
+
+    impl Reporter for RecordingReporter {
+        fn record_report(
+            &self,
+            issue_number: u64,
+            status: Status,
+            detail: Option<&str>,
+            pull_request: Option<PullRequest>,
+        ) -> anyhow::Result<()> {
+            if self.unknown_issue {
+                anyhow::bail!("joop has no session for jaywhy13/joop#{issue_number}");
+            }
+            self.reports.lock().unwrap().push(RecordedReport {
+                issue_number,
+                status,
+                detail: detail.map(str::to_string),
+                pull_request,
+            });
+            Ok(())
+        }
+
+        fn sessions(&self) -> Vec<Session> {
+            Vec::new()
+        }
+    }
+
+    fn context(reporter: Arc<RecordingReporter>) -> ApiContext {
+        ApiContext { reporter }
+    }
+
+    fn accepting() -> Arc<RecordingReporter> {
+        Arc::new(RecordingReporter::default())
     }
 
     #[test]
     fn health_is_served() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let response = handle(&context(&dir), "GET", "/health", "");
+        let response = handle(&context(accepting()), "GET", "/health", "");
 
         assert_eq!(response.code, 200);
         assert!(response.body.contains("\"ok\":true"));
     }
 
     #[test]
-    fn a_report_records_the_status_and_heartbeat() {
-        let dir = tempfile::tempdir().unwrap();
-        let context = context(&dir);
+    fn a_report_is_passed_on_with_its_detail() {
+        let reporter = accepting();
 
         let response = handle(
-            &context,
+            &context(reporter.clone()),
             "POST",
             "/report",
             r#"{"issue":42,"status":"working","detail":"writing tests"}"#,
         );
 
         assert_eq!(response.code, 200, "body: {}", response.body);
-        let state = context.state.lock().unwrap();
-        let session = state.session("jaywhy13/joop", 42).unwrap();
-        assert_eq!(session.status, Status::Working);
-        assert_eq!(session.detail.as_deref(), Some("writing tests"));
-        assert_eq!(
-            session.last_update_at,
-            Some(Utc.with_ymd_and_hms(2026, 10, 11, 12, 5, 0).unwrap())
-        );
+        let reports = reporter.reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].issue_number, 42);
+        assert_eq!(reports[0].status, Status::Working);
+        assert_eq!(reports[0].detail.as_deref(), Some("writing tests"));
     }
 
     #[test]
-    fn a_report_without_a_detail_is_still_a_heartbeat() {
-        let dir = tempfile::tempdir().unwrap();
-        let context = context(&dir);
+    fn a_report_without_a_detail_is_still_accepted() {
+        let reporter = accepting();
 
         let response = handle(
-            &context,
+            &context(reporter.clone()),
             "POST",
             "/report",
             r#"{"issue":42,"status":"started"}"#,
         );
 
         assert_eq!(response.code, 200, "body: {}", response.body);
-        assert!(
-            context
-                .state
-                .lock()
-                .unwrap()
-                .session("jaywhy13/joop", 42)
-                .unwrap()
-                .last_update_at
-                .is_some()
+        assert_eq!(reporter.reports.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_pull_request_url_is_carried_through() {
+        let reporter = accepting();
+
+        handle(
+            &context(reporter.clone()),
+            "POST",
+            "/report",
+            r#"{"issue":42,"status":"review","pull_request":"https://github.com/jaywhy13/joop/pull/7"}"#,
+        );
+
+        let reports = reporter.reports.lock().unwrap();
+        assert_eq!(
+            reports[0].pull_request,
+            Some(PullRequest {
+                number: 7,
+                url: "https://github.com/jaywhy13/joop/pull/7".into()
+            })
         );
     }
 
     #[test]
-    fn an_unknown_issue_is_rejected_with_404() {
-        let dir = tempfile::tempdir().unwrap();
+    fn reporting_review_without_a_pull_request_is_rejected() {
+        let reporter = accepting();
 
         let response = handle(
-            &context(&dir),
+            &context(reporter.clone()),
+            "POST",
+            "/report",
+            r#"{"issue":42,"status":"review"}"#,
+        );
+
+        assert_eq!(response.code, 400);
+        assert!(
+            response.body.contains("pull_request"),
+            "body: {}",
+            response.body
+        );
+        assert!(
+            reporter.reports.lock().unwrap().is_empty(),
+            "a review with no pull request is nothing joop can show"
+        );
+    }
+
+    #[test]
+    fn a_merged_report_needs_no_pull_request_repeated() {
+        let reporter = accepting();
+
+        let response = handle(
+            &context(reporter.clone()),
+            "POST",
+            "/report",
+            r#"{"issue":42,"status":"merged"}"#,
+        );
+
+        assert_eq!(response.code, 200, "body: {}", response.body);
+        assert_eq!(reporter.reports.lock().unwrap()[0].status, Status::Merged);
+    }
+
+    #[test]
+    fn an_unknown_issue_is_rejected_with_404() {
+        let response = handle(
+            &context(Arc::new(RecordingReporter::rejecting_unknown_issues())),
             "POST",
             "/report",
             r#"{"issue":99,"status":"working"}"#,
@@ -256,10 +375,8 @@ mod tests {
 
     #[test]
     fn an_unknown_status_is_rejected_with_400() {
-        let dir = tempfile::tempdir().unwrap();
-
         let response = handle(
-            &context(&dir),
+            &context(accepting()),
             "POST",
             "/report",
             r#"{"issue":42,"status":"vibing"}"#,
@@ -271,11 +388,9 @@ mod tests {
 
     #[test]
     fn agents_may_not_report_statuses_that_joop_owns() {
-        let dir = tempfile::tempdir().unwrap();
-
         for status in ["dispatched", "stale", "dead"] {
             let response = handle(
-                &context(&dir),
+                &context(accepting()),
                 "POST",
                 "/report",
                 &format!(r#"{{"issue":42,"status":"{status}"}}"#),
@@ -287,35 +402,52 @@ mod tests {
 
     #[test]
     fn malformed_json_is_rejected_with_400() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let response = handle(&context(&dir), "POST", "/report", "{ not json");
-
-        assert_eq!(response.code, 400);
+        assert_eq!(
+            handle(&context(accepting()), "POST", "/report", "{ not json").code,
+            400
+        );
     }
 
     #[test]
     fn sessions_are_listed_for_inspection() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let response = handle(&context(&dir), "GET", "/sessions", "");
+        let response = handle(&context(accepting()), "GET", "/sessions", "");
 
         assert_eq!(response.code, 200);
-        assert!(response.body.contains("jaywhy13/joop#42"));
-        assert!(response.body.contains("issue-42"));
     }
 
     #[test]
     fn unknown_routes_are_404() {
-        let dir = tempfile::tempdir().unwrap();
-
-        assert_eq!(handle(&context(&dir), "GET", "/nope", "").code, 404);
+        assert_eq!(handle(&context(accepting()), "GET", "/nope", "").code, 404);
     }
 
     #[test]
-    fn query_strings_do_not_break_routing() {
-        let dir = tempfile::tempdir().unwrap();
+    fn a_bare_pull_request_number_is_accepted() {
+        assert_eq!(
+            parse_pull_request("7"),
+            Ok(PullRequest {
+                number: 7,
+                url: String::new()
+            })
+        );
+        assert_eq!(parse_pull_request("#7").unwrap().number, 7);
+    }
 
-        assert_eq!(handle(&context(&dir), "GET", "/health", "").code, 200);
+    #[test]
+    fn a_pull_request_url_keeps_both_number_and_link() {
+        let parsed = parse_pull_request("https://github.com/jaywhy13/joop/pull/110").unwrap();
+
+        assert_eq!(parsed.number, 110);
+        assert_eq!(parsed.url, "https://github.com/jaywhy13/joop/pull/110");
+    }
+
+    #[test]
+    fn an_issue_url_is_not_mistaken_for_a_pull_request() {
+        assert!(parse_pull_request("https://github.com/jaywhy13/joop/issues/42").is_err());
+    }
+
+    #[test]
+    fn nonsense_in_place_of_a_pull_request_is_refused() {
+        assert!(parse_pull_request("soon").is_err());
+        assert!(parse_pull_request("0").is_err());
     }
 }

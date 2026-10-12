@@ -9,13 +9,13 @@ use joop::clock::{Clock, SystemClock};
 use joop::config::{Cli, Command, ForgetArgs, ReportArgs, RunArgs, StatusArgs};
 use joop::engine::{Engine, EngineSettings};
 use joop::github::{GhIssues, IssueSource, repo_in_dir, verify_repo};
+use joop::herdr::{AgentHost, HerdrAgents};
 use joop::limits::{ClaudeLimits, LimitWatcher};
 use joop::runner::SystemRunner;
 use joop::state::State;
 use joop::supervisor::Supervisor;
 use joop::ui::{Dashboard, relative, truncate};
 use joop::worktree::{GitWorktrees, WorktreeProvider, default_root};
-use joop::zellij::{TabHost, ZellijTabs};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -45,6 +45,7 @@ fn report(args: ReportArgs) -> Result<()> {
             issue: args.issue,
             status: args.status,
             detail: args.detail,
+            pull_request: args.pull_request,
         },
     )?;
 
@@ -66,16 +67,21 @@ fn status(args: StatusArgs) -> Result<()> {
     }
 
     println!(
-        "{:<8} {:<34} {:<11} {:<14} {:<13} LATEST",
-        "ISSUE", "TITLE", "STATUS", "TAB", "LAST UPDATE"
+        "{:<8} {:<34} {:<11} {:<8} {:<14} {:<13} LATEST",
+        "ISSUE", "TITLE", "STATUS", "PR", "TAB", "LAST UPDATE"
     );
     for session in state.sessions().values() {
         println!(
-            "{:<8} {:<34} {:<11} {:<14} {:<13} {}",
+            "{:<8} {:<34} {:<11} {:<8} {:<14} {:<13} {}",
             format!("#{}", session.issue_number),
             truncate(&session.issue_title, 34),
             session.status.as_str(),
-            truncate(&session.tab_name, 14),
+            session
+                .pull_request
+                .as_ref()
+                .map(|pull_request| format!("#{}", pull_request.number))
+                .unwrap_or_else(|| "-".into()),
+            truncate(&session.agent_name, 14),
             session
                 .last_update_at
                 .map(|at| relative(at, now))
@@ -133,7 +139,7 @@ fn run(args: RunArgs) -> Result<()> {
         .unwrap_or_else(|| default_root(&repo_path));
     let worktrees: Arc<dyn WorktreeProvider> =
         Arc::new(GitWorktrees::new(runner, &repo_path, &worktree_root));
-    let tabs: Arc<dyn TabHost> = Arc::new(ZellijTabs::new(runner, &args.session));
+    let agents: Arc<dyn AgentHost> = Arc::new(HerdrAgents::new(runner, &args.workspace));
 
     let limits: Option<Arc<dyn LimitWatcher>> = if args.no_limit_checks {
         None
@@ -149,14 +155,15 @@ fn run(args: RunArgs) -> Result<()> {
             label: args.label.clone(),
             skill_command: args.skill.clone(),
             api_url: args.api_url(),
-            agent_command: vec![args.agent.clone()],
+            agent_kind: args.agent.clone(),
+            agent_args: args.agent_args.clone(),
             policy,
             limit_threshold,
             max_attempts,
         },
         issues,
         worktrees,
-        tabs.clone(),
+        agents.clone(),
         limits,
         clock.clone(),
         state.clone(),
@@ -165,9 +172,7 @@ fn run(args: RunArgs) -> Result<()> {
     api::serve(
         args.api_address(),
         ApiContext {
-            state: state.clone(),
-            repo: repo.clone(),
-            clock,
+            reporter: engine.clone(),
         },
     )?;
 
@@ -187,7 +192,7 @@ fn run(args: RunArgs) -> Result<()> {
         bail!("the joop supervisor stopped unexpectedly; see the log for the cause");
     }
 
-    Dashboard::new(engine, tabs).run(&supervisor)?;
+    Dashboard::new(engine, agents).run(&supervisor)?;
     supervisor.stop();
     Ok(())
 }

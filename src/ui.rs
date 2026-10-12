@@ -17,24 +17,24 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::engine::{Engine, Level, PendingIssue, Snapshot};
+use crate::herdr::AgentHost;
 use crate::state::{Session, Status};
 use crate::supervisor::Supervisor;
-use crate::zellij::TabHost;
 
-/// The dashboard: which issues are in flight, which Zellij tab each one is in, and the
+/// The dashboard: which issues are in flight, which herdr tab each one is in, and the
 /// last thing its agent said.
 pub struct Dashboard {
     engine: Arc<Engine>,
-    tabs: Arc<dyn TabHost>,
+    agents: Arc<dyn AgentHost>,
     selected: TableState,
     notice: Option<String>,
 }
 
 impl Dashboard {
-    pub fn new(engine: Arc<Engine>, tabs: Arc<dyn TabHost>) -> Self {
+    pub fn new(engine: Arc<Engine>, agents: Arc<dyn AgentHost>) -> Self {
         Self {
             engine,
-            tabs,
+            agents,
             selected: TableState::default().with_selected(Some(0)),
             notice: None,
         }
@@ -98,16 +98,15 @@ impl Dashboard {
         self.selected.select(Some(next));
     }
 
-    /// Jump the terminal to the selected agent's tab.
+    /// Bring the selected agent's herdr tab to the front.
     fn focus_selected(&mut self, snapshot: &Snapshot) {
         let Some(session) = self.selected_session(snapshot) else {
             return;
         };
 
-        // Focusing is a tab switch with no input, so an empty line is never typed.
-        self.notice = match self.tabs.focus(&session.tab_name) {
-            Ok(()) => Some(format!("focused tab {}", session.tab_name)),
-            Err(error) => Some(format!("could not focus {}: {error:#}", session.tab_name)),
+        self.notice = match self.agents.focus_tab(&session.tab_id) {
+            Ok(()) => Some(format!("focused {}", session.agent_name)),
+            Err(error) => Some(format!("could not focus {}: {error:#}", session.agent_name)),
         };
     }
 
@@ -238,6 +237,7 @@ impl Dashboard {
                     Cell::from(format!("#{}", session.issue_number)),
                     Cell::from(truncate(&session.issue_title, 34)),
                     Cell::from(session.status.as_str()).style(status_style(session.status)),
+                    Cell::from(pull_request_label(session)).style(Style::new().fg(Color::Cyan)),
                     Cell::from(tab_label(session)),
                     Cell::from(
                         session
@@ -268,12 +268,13 @@ impl Dashboard {
             rows,
             [
                 Constraint::Length(7),
-                Constraint::Min(20),
+                Constraint::Min(18),
                 Constraint::Length(11),
+                Constraint::Length(13),
                 Constraint::Length(12),
                 Constraint::Length(12),
                 Constraint::Length(10),
-                Constraint::Min(16),
+                Constraint::Min(14),
             ],
         )
         .header(header)
@@ -344,15 +345,20 @@ fn draw_pending(frame: &mut ratatui::Frame<'_>, area: Rect, pending: &[PendingIs
 }
 
 fn tab_label(session: &Session) -> String {
-    match &session.tab_id {
-        Some(id) => format!("{} ({id})", session.tab_name),
-        None => session.tab_name.clone(),
+    session.tab_id.clone()
+}
+
+/// The pull request an agent reported, so the dashboard shows what is up for review.
+fn pull_request_label(session: &Session) -> String {
+    match &session.pull_request {
+        Some(pull_request) => format!("#{}", pull_request.number),
+        None => "—".to_string(),
     }
 }
 
 fn status_style(status: Status) -> Style {
     match status {
-        Status::Done => Style::new().fg(Color::Green),
+        Status::Done | Status::Merged => Style::new().fg(Color::Green),
         Status::Review => Style::new().fg(Color::Cyan),
         Status::Working | Status::Started => Style::new().fg(Color::Blue),
         Status::Dispatched => Style::new().fg(Color::Gray),
@@ -475,6 +481,7 @@ mod tests {
             Status::Blocked,
             Status::Review,
             Status::Done,
+            Status::Merged,
             Status::Failed,
             Status::Stale,
             Status::Dead,

@@ -6,12 +6,12 @@ use chrono::{DateTime, Utc};
 
 use crate::clock::Clock;
 use crate::github::IssueSource;
+use crate::herdr::{AgentHost, AgentSpec, PaneMetadata};
 use crate::issue::Issue;
 use crate::limits::{LimitSnapshot, LimitWatcher};
 use crate::prompt::{Briefing, build_prompt};
-use crate::state::{Dispatch, HeartbeatPolicy, Session, State};
+use crate::state::{Dispatch, HeartbeatPolicy, PullRequest, Session, State, Status};
 use crate::worktree::{WorktreeProvider, branch_for};
-use crate::zellij::{TabHost, TabSpec};
 
 /// How many recent events the dashboard keeps.
 pub const MAX_EVENTS: usize = 200;
@@ -23,8 +23,10 @@ pub struct EngineSettings {
     pub label: String,
     pub skill_command: String,
     pub api_url: String,
-    /// The agent to run in each tab, e.g. `["pi"]`.
-    pub agent_command: Vec<String>,
+    /// Agent kind herdr should start, e.g. `claude`.
+    pub agent_kind: String,
+    /// Arguments passed to the agent binary itself, e.g. `--dangerously-skip-permissions`.
+    pub agent_args: Vec<String>,
     pub policy: HeartbeatPolicy,
     /// Fraction of a Claude limit at which joop stops starting new work.
     pub limit_threshold: f64,
@@ -84,7 +86,7 @@ pub struct Engine {
     settings: EngineSettings,
     issues: Arc<dyn IssueSource>,
     worktrees: Arc<dyn WorktreeProvider>,
-    tabs: Arc<dyn TabHost>,
+    agents: Arc<dyn AgentHost>,
     limits: Option<Arc<dyn LimitWatcher>>,
     clock: Arc<dyn Clock>,
     state: Arc<Mutex<State>>,
@@ -94,6 +96,22 @@ pub struct Engine {
     events: Mutex<VecDeque<Event>>,
 }
 
+impl crate::api::Reporter for Engine {
+    fn record_report(
+        &self,
+        issue_number: u64,
+        status: Status,
+        detail: Option<&str>,
+        pull_request: Option<PullRequest>,
+    ) -> Result<()> {
+        Engine::record_report(self, issue_number, status, detail, pull_request)
+    }
+
+    fn sessions(&self) -> Vec<Session> {
+        Engine::sessions(self)
+    }
+}
+
 /// What joop has noticed, as opposed to what it has recorded in `state.json`.
 #[derive(Default)]
 struct Observed {
@@ -101,7 +119,6 @@ struct Observed {
     pause: Option<Pause>,
     limits: Option<LimitSnapshot>,
     pending: Vec<PendingIssue>,
-    session_ensured: bool,
 }
 
 /// Take a lock, recovering from a panic in another thread rather than poisoning the
@@ -117,7 +134,7 @@ impl Engine {
         settings: EngineSettings,
         issues: Arc<dyn IssueSource>,
         worktrees: Arc<dyn WorktreeProvider>,
-        tabs: Arc<dyn TabHost>,
+        agents: Arc<dyn AgentHost>,
         limits: Option<Arc<dyn LimitWatcher>>,
         clock: Arc<dyn Clock>,
         state: Arc<Mutex<State>>,
@@ -126,7 +143,7 @@ impl Engine {
             settings,
             issues,
             worktrees,
-            tabs,
+            agents,
             limits,
             clock,
             state,
@@ -181,7 +198,6 @@ impl Engine {
         }
 
         self.remember_pending(&unclaimed);
-        self.ensure_session()?;
 
         for issue in &unclaimed {
             match self.dispatch(issue) {
@@ -323,6 +339,66 @@ impl Engine {
         lock(&self.observed).pause.clone()
     }
 
+    /// Apply an agent's report, then act on what it said: a pull request is pushed onto the
+    /// agent's herdr pane, and a merged one means the work has landed, so its tab closes.
+    pub fn record_report(
+        &self,
+        issue_number: u64,
+        status: Status,
+        detail: Option<&str>,
+        pull_request: Option<PullRequest>,
+    ) -> Result<()> {
+        lock(&self.state).record_report(
+            &self.settings.repo,
+            issue_number,
+            status,
+            detail,
+            pull_request,
+            self.clock.now(),
+        )?;
+
+        let Some(session) = lock(&self.state)
+            .session(&self.settings.repo, issue_number)
+            .cloned()
+        else {
+            return Ok(());
+        };
+
+        self.describe_agent_to_herdr(
+            &session.pane_id,
+            issue_number,
+            session.status,
+            session.pull_request.as_ref(),
+        );
+
+        if let (Status::Review, Some(pull_request)) = (status, &session.pull_request) {
+            self.log(
+                Level::Info,
+                format!("#{issue_number} opened PR #{}", pull_request.number),
+            );
+        }
+
+        if status == Status::Merged {
+            let landed = session
+                .pull_request
+                .as_ref()
+                .map(|pull_request| format!("PR #{}", pull_request.number))
+                .unwrap_or_else(|| "its work".to_string());
+            self.log(
+                Level::Info,
+                format!("#{issue_number}: {landed} merged; closing its herdr tab"),
+            );
+            self.abandon_tab(&session.tab_id);
+        }
+
+        Ok(())
+    }
+
+    /// Every session joop knows about, for the reporting API to serve.
+    pub fn sessions(&self) -> Vec<Session> {
+        lock(&self.state).sessions().values().cloned().collect()
+    }
+
     /// Forget joop's record of an issue so that a later poll picks it up again.
     pub fn forget(&self, issue_number: u64) -> Result<bool> {
         let forgotten = lock(&self.state).forget(&self.settings.repo, issue_number)?;
@@ -389,21 +465,12 @@ impl Engine {
             .retain(|pending| pending.number != issue_number);
     }
 
-    fn ensure_session(&self) -> Result<()> {
-        if lock(&self.observed).session_ensured {
-            return Ok(());
-        }
-        self.tabs.ensure_session()?;
-        lock(&self.observed).session_ensured = true;
-        Ok(())
-    }
-
     /// Give one issue to a fresh agent.
     fn dispatch(&self, issue: &Issue) -> Result<()> {
         let slug = issue.slug();
         let branch = branch_for(&slug);
         let worktree = self.worktrees.prepare(&slug, &branch)?;
-        let tab_id = self.open_tab(issue, &slug, &worktree, 1)?;
+        let agent = self.start_agent(issue, &slug, &worktree, 1)?;
 
         let record = lock(&self.state).record_dispatch(Dispatch {
             repo: self.settings.repo.clone(),
@@ -411,8 +478,9 @@ impl Engine {
             issue_title: issue.title.clone(),
             issue_url: issue.url.clone(),
             issue_body: issue.body.clone(),
-            tab_name: slug.clone(),
-            tab_id: tab_id.clone(),
+            agent_name: agent.name.clone(),
+            tab_id: agent.tab_id.clone(),
+            pane_id: agent.pane_id.clone(),
             branch,
             worktree,
             at: self.clock.now(),
@@ -422,7 +490,7 @@ impl Engine {
         // An agent joop failed to record is an agent it cannot supervise, and the next
         // poll would start a second one in the same worktree. Shut it down.
         if let Err(error) = record {
-            self.abandon_tab(&slug, tab_id.as_deref());
+            self.abandon_tab(&agent.tab_id);
             return Err(error);
         }
 
@@ -436,13 +504,24 @@ impl Engine {
         Ok(())
     }
 
-    fn open_tab(
+    /// Open a tab, start the agent in it, and hand it its brief. herdr starts the agent
+    /// and the prompt goes in separately, so a tab that comes up without an agent never
+    /// silently swallows the instructions.
+    fn start_agent(
         &self,
         issue: &Issue,
         slug: &str,
         worktree: &std::path::Path,
         attempt: u32,
-    ) -> Result<Option<String>> {
+    ) -> Result<crate::herdr::RunningAgent> {
+        let agent = self.agents.start(&AgentSpec {
+            name: slug.to_string(),
+            cwd: worktree.to_path_buf(),
+            kind: self.settings.agent_kind.clone(),
+            agent_args: self.settings.agent_args.clone(),
+            env: vec![("JOOP_API_URL".into(), self.settings.api_url.clone())],
+        })?;
+
         let prompt = build_prompt(&Briefing {
             issue,
             repo: &self.settings.repo,
@@ -452,39 +531,69 @@ impl Engine {
             attempt,
         });
 
-        let mut command = self.settings.agent_command.clone();
-        command.push(prompt);
+        if let Err(error) = self.agents.prompt(&agent.name, &prompt) {
+            self.abandon_tab(&agent.tab_id);
+            return Err(error);
+        }
 
-        self.tabs.open(&TabSpec {
-            name: slug.to_string(),
-            cwd: worktree.to_path_buf(),
-            command,
-        })
+        self.describe_agent_to_herdr(&agent.pane_id, issue.number, Status::Dispatched, None);
+        Ok(agent)
+    }
+
+    /// Push what joop knows onto the agent's herdr pane, so the issue and its pull request
+    /// show up under the agent in herdr's own UI rather than only on joop's dashboard.
+    fn describe_agent_to_herdr(
+        &self,
+        pane_id: &str,
+        issue_number: u64,
+        status: Status,
+        pull_request: Option<&PullRequest>,
+    ) {
+        let title = match pull_request {
+            Some(pull_request) => format!("#{issue_number} · PR #{}", pull_request.number),
+            None => format!("#{issue_number}"),
+        };
+
+        let mut tokens = vec![
+            ("issue".to_string(), issue_number.to_string()),
+            ("status".to_string(), status.as_str().to_string()),
+        ];
+        if let Some(pull_request) = pull_request {
+            tokens.push(("pull_request".to_string(), pull_request.number.to_string()));
+            tokens.push(("pr_url".to_string(), pull_request.url.clone()));
+        }
+
+        let metadata = PaneMetadata {
+            title: Some(title),
+            tokens,
+        };
+
+        if let Err(error) = self.agents.report_metadata(pane_id, &metadata) {
+            self.log(
+                Level::Warn,
+                format!("could not show #{issue_number} on its herdr pane: {error:#}"),
+            );
+        }
     }
 
     /// Close a tab joop has decided it no longer owns. Returns whether it is gone.
-    fn abandon_tab(&self, tab_name: &str, tab_id: Option<&str>) -> bool {
-        let closed = match tab_id {
-            Some(tab_id) => self.tabs.close(tab_id),
-            None => self.tabs.close_by_name(tab_name),
-        };
-
-        match closed {
+    fn abandon_tab(&self, tab_id: &str) -> bool {
+        match self.agents.close_tab(tab_id) {
             Ok(()) => true,
             Err(error) => {
                 self.log(
                     Level::Warn,
-                    format!("could not close tab {tab_name}: {error:#}"),
+                    format!("could not close herdr tab {tab_id}: {error:#}"),
                 );
                 false
             }
         }
     }
 
-    /// Declare dead any session whose Zellij tab has gone, rather than waiting out its
+    /// Declare dead any session whose herdr tab has gone, rather than waiting out its
     /// heartbeat. A tab the user closed by hand is an agent that is not coming back.
     fn reconcile_tabs(&self) {
-        let open = match self.tabs.tab_names() {
+        let open = match self.agents.tab_labels() {
             Ok(names) => names,
             // Not knowing is not evidence of absence; the heartbeat still covers this.
             Err(_) => return,
@@ -496,25 +605,25 @@ impl Engine {
                 .sessions()
                 .values()
                 .filter(|session| session.status.is_live())
-                .map(|session| (session.issue_number, session.tab_name.clone()))
+                .map(|session| (session.issue_number, session.agent_name.clone()))
                 .collect()
         };
 
-        for (issue_number, tab_name) in live {
-            if open.iter().any(|name| name == &tab_name) {
+        for (issue_number, agent_name) in live {
+            if open.iter().any(|label| label == &agent_name) {
                 continue;
             }
 
             let marked = lock(&self.state).mark_dead(
                 &self.settings.repo,
                 issue_number,
-                "its Zellij tab is gone",
+                "its herdr tab is gone",
             );
 
             match marked {
                 Ok(true) => self.log(
                     Level::Warn,
-                    format!("tab {tab_name} has gone; reassigning #{issue_number}"),
+                    format!("tab {agent_name} has gone; reassigning #{issue_number}"),
                 ),
                 Ok(false) => {}
                 Err(error) => self.log(
@@ -535,8 +644,6 @@ impl Engine {
         if queued.is_empty() {
             return Ok(());
         }
-
-        self.ensure_session()?;
 
         for session in queued {
             if session.attempts >= self.settings.max_attempts {
@@ -563,7 +670,7 @@ impl Engine {
         );
 
         // Nothing more will be done with this issue, so its tab should not be left open.
-        self.abandon_tab(&session.tab_name, session.tab_id.as_deref());
+        self.abandon_tab(&session.tab_id);
 
         let parked = lock(&self.state).abandon(&self.settings.repo, session.issue_number, &reason);
 
@@ -579,7 +686,7 @@ impl Engine {
     fn reassign(&self, session: &Session) -> Result<()> {
         // The dead agent's tab must be gone before a replacement starts, or two agents
         // end up writing to one worktree.
-        if !self.abandon_tab(&session.tab_name, session.tab_id.as_deref()) {
+        if !self.abandon_tab(&session.tab_id) {
             return Err(anyhow!(
                 "its tab is still open, so a replacement would share the worktree;                  will try again on the next audit"
             ));
@@ -597,20 +704,21 @@ impl Engine {
         // Reuse the branch and worktree: they may hold the dead agent's partial work.
         let worktree = self.worktrees.prepare(&slug, &session.branch)?;
         let attempt = session.attempts + 1;
-        let tab_id = self.open_tab(&issue, &slug, &worktree, attempt)?;
+        let agent = self.start_agent(&issue, &slug, &worktree, attempt)?;
 
         let recorded = lock(&self.state).record_reassignment(
             &self.settings.repo,
             session.issue_number,
-            slug.clone(),
-            tab_id.clone(),
+            agent.name.clone(),
+            agent.tab_id.clone(),
+            agent.pane_id.clone(),
             self.clock.now(),
         );
 
         let attempts = match recorded {
             Ok(attempts) => attempts,
             Err(error) => {
-                self.abandon_tab(&slug, tab_id.as_deref());
+                self.abandon_tab(&agent.tab_id);
                 return Err(error);
             }
         };
@@ -633,9 +741,6 @@ impl Engine {
             return Ok(());
         }
 
-        // Typing into a tab means focusing it, so remember where the user was.
-        let was_focused = self.tabs.current_tab_name().ok().flatten();
-
         for session in &resumed {
             let issue_number = session.issue_number;
             let message = format!(
@@ -645,20 +750,16 @@ impl Engine {
                  are doing>\"`."
             );
 
-            match self.tabs.send_line(&session.tab_name, &message) {
+            match self.agents.prompt(&session.agent_name, &message) {
                 Ok(()) => self.log(
                     Level::Info,
-                    format!("told {} to continue", session.tab_name),
+                    format!("told {} to continue", session.agent_name),
                 ),
                 Err(error) => self.log(
                     Level::Warn,
-                    format!("could not nudge {}: {error:#}", session.tab_name),
+                    format!("could not nudge {}: {error:#}", session.agent_name),
                 ),
             }
-        }
-
-        if let Some(tab_name) = was_focused {
-            let _ = self.tabs.focus(&tab_name);
         }
 
         Ok(())
@@ -669,11 +770,11 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
+    use crate::herdr::{AgentHost, AgentSpec, PaneMetadata, RunningAgent};
     use crate::issue::Issue;
     use crate::limits::{LimitSnapshot, LimitWatcher};
-    use crate::state::{HeartbeatPolicy, State, Status};
+    use crate::state::{HeartbeatPolicy, PullRequest, State, Status};
     use crate::worktree::WorktreeProvider;
-    use crate::zellij::{TabHost, TabSpec};
     use chrono::{DateTime, Duration, TimeZone, Utc};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -738,92 +839,108 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct FakeTabs {
-        opened: Mutex<Vec<TabSpec>>,
+    struct FakeHerdr {
+        started: Mutex<Vec<AgentSpec>>,
+        prompts: Mutex<Vec<(String, String)>>,
         closed: Mutex<Vec<String>>,
-        closed_by_name: Mutex<Vec<String>>,
         focused: Mutex<Vec<String>>,
-        lines: Mutex<Vec<(String, String)>>,
-        sessions_ensured: Mutex<u32>,
+        metadata: Mutex<Vec<(String, PaneMetadata)>>,
+        workspaces_ensured: Mutex<u32>,
         next_id: Mutex<u32>,
-        /// Tabs reported as open; None means "report whatever was opened".
-        open_names: Mutex<Option<Vec<String>>>,
-        /// When set, every close fails, as if Zellij were unreachable.
+        /// Tab labels herdr reports as open; None means "whatever was started".
+        open_labels: Mutex<Option<Vec<String>>>,
+        /// When set, every close fails, as if herdr were unreachable.
         closing_fails: Mutex<bool>,
-        current: Mutex<Option<String>>,
     }
 
-    impl FakeTabs {
-        fn opened_names(&self) -> Vec<String> {
-            self.opened
+    impl FakeHerdr {
+        fn started_names(&self) -> Vec<String> {
+            self.started
                 .lock()
                 .unwrap()
                 .iter()
                 .map(|spec| spec.name.clone())
                 .collect()
         }
+
         fn last_prompt(&self) -> String {
-            self.opened
+            self.prompts
                 .lock()
                 .unwrap()
                 .last()
-                .expect("a tab was opened")
-                .command
-                .last()
-                .expect("a prompt was passed")
+                .expect("a prompt was sent")
+                .1
                 .clone()
+        }
+
+        /// The metadata most recently pushed for a pane.
+        fn metadata_for(&self, pane_id: &str) -> Option<PaneMetadata> {
+            self.metadata
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(pane, _)| pane == pane_id)
+                .map(|(_, metadata)| metadata.clone())
         }
     }
 
-    impl TabHost for FakeTabs {
-        fn ensure_session(&self) -> Result<()> {
-            *self.sessions_ensured.lock().unwrap() += 1;
-            Ok(())
+    impl AgentHost for FakeHerdr {
+        fn ensure_workspace(&self) -> Result<String> {
+            *self.workspaces_ensured.lock().unwrap() += 1;
+            Ok("w4".into())
         }
-        fn open(&self, spec: &TabSpec) -> Result<Option<String>> {
-            self.opened.lock().unwrap().push(spec.clone());
+
+        fn start(&self, spec: &AgentSpec) -> Result<RunningAgent> {
+            // The real adapter resolves the workspace as part of starting; model that so
+            // callers cannot quietly depend on doing it themselves.
+            self.ensure_workspace()?;
+            self.started.lock().unwrap().push(spec.clone());
             let mut next = self.next_id.lock().unwrap();
             *next += 1;
-            Ok(Some(next.to_string()))
+            Ok(RunningAgent {
+                tab_id: format!("w4:t{next}"),
+                pane_id: format!("w4:p{next}"),
+                name: spec.name.clone(),
+            })
         }
-        fn close(&self, tab_id: &str) -> Result<()> {
+
+        fn prompt(&self, agent_name: &str, text: &str) -> Result<()> {
+            self.prompts
+                .lock()
+                .unwrap()
+                .push((agent_name.to_string(), text.to_string()));
+            Ok(())
+        }
+
+        fn close_tab(&self, tab_id: &str) -> Result<()> {
             if *self.closing_fails.lock().unwrap() {
-                anyhow::bail!("zellij is not answering");
+                anyhow::bail!("herdr is not answering");
             }
             self.closed.lock().unwrap().push(tab_id.to_string());
             Ok(())
         }
-        fn close_by_name(&self, tab_name: &str) -> Result<()> {
-            if *self.closing_fails.lock().unwrap() {
-                anyhow::bail!("zellij is not answering");
-            }
-            self.closed_by_name
+
+        fn focus_tab(&self, tab_id: &str) -> Result<()> {
+            self.focused.lock().unwrap().push(tab_id.to_string());
+            Ok(())
+        }
+
+        fn report_metadata(&self, pane_id: &str, metadata: &PaneMetadata) -> Result<()> {
+            self.metadata
                 .lock()
                 .unwrap()
-                .push(tab_name.to_string());
+                .push((pane_id.to_string(), metadata.clone()));
             Ok(())
         }
-        fn current_tab_name(&self) -> Result<Option<String>> {
-            Ok(self.current.lock().unwrap().clone())
-        }
-        fn focus(&self, tab_name: &str) -> Result<()> {
-            self.focused.lock().unwrap().push(tab_name.to_string());
-            Ok(())
-        }
-        fn send_line(&self, tab_name: &str, line: &str) -> Result<()> {
-            self.lines
-                .lock()
-                .unwrap()
-                .push((tab_name.to_string(), line.to_string()));
-            Ok(())
-        }
-        fn tab_names(&self) -> Result<Vec<String>> {
+
+        fn tab_labels(&self) -> Result<Vec<String>> {
             Ok(self
-                .open_names
+                .open_labels
                 .lock()
                 .unwrap()
                 .clone()
-                .unwrap_or_else(|| self.opened_names()))
+                .unwrap_or_else(|| self.started_names()))
         }
     }
 
@@ -863,7 +980,7 @@ mod tests {
         engine: Engine,
         issues: Arc<FakeIssues>,
         worktrees: Arc<FakeWorktrees>,
-        tabs: Arc<FakeTabs>,
+        herdr: Arc<FakeHerdr>,
         limits: Arc<FakeLimits>,
         clock: Arc<FixedClock>,
         state: Arc<Mutex<State>>,
@@ -883,7 +1000,7 @@ mod tests {
             State::load(&dir.path().join("state.json")).unwrap(),
         ));
         let clock = Arc::new(FixedClock::new(at(0)));
-        let tabs = Arc::new(FakeTabs::default());
+        let herdr = Arc::new(FakeHerdr::default());
         let worktrees = Arc::new(FakeWorktrees::default());
 
         let engine = Engine::new(
@@ -892,14 +1009,15 @@ mod tests {
                 label: "loop".into(),
                 skill_command: "/implement".into(),
                 api_url: "http://127.0.0.1:7777".into(),
-                agent_command: vec!["pi".into()],
+                agent_kind: "claude".into(),
+                agent_args: vec!["--dangerously-skip-permissions".into()],
                 policy: HeartbeatPolicy::default(),
                 limit_threshold: 0.9,
                 max_attempts: 3,
             },
             issues.clone(),
             worktrees.clone(),
-            tabs.clone(),
+            herdr.clone(),
             Some(limits.clone()),
             clock.clone(),
             state.clone(),
@@ -909,7 +1027,7 @@ mod tests {
             engine,
             issues,
             worktrees,
-            tabs,
+            herdr,
             limits,
             clock,
             state,
@@ -923,11 +1041,20 @@ mod tests {
 
         harness.engine.poll().unwrap();
 
-        assert_eq!(harness.tabs.opened_names(), vec!["issue-42"]);
-        let spec = harness.tabs.opened.lock().unwrap()[0].clone();
+        assert_eq!(harness.herdr.started_names(), vec!["issue-42"]);
+        let spec = harness.herdr.started.lock().unwrap()[0].clone();
         assert_eq!(spec.cwd, PathBuf::from("/worktrees/issue-42"));
-        assert_eq!(spec.command[0], "pi");
-        assert!(harness.tabs.last_prompt().starts_with("/implement "));
+        assert_eq!(spec.kind, "claude");
+        assert_eq!(spec.agent_args, vec!["--dangerously-skip-permissions"]);
+        assert_eq!(
+            spec.env,
+            vec![(
+                "JOOP_API_URL".to_string(),
+                "http://127.0.0.1:7777".to_string()
+            )],
+            "the agent needs to know where to report"
+        );
+        assert!(harness.herdr.last_prompt().starts_with("/implement "));
     }
 
     #[test]
@@ -939,21 +1066,22 @@ mod tests {
         std::fs::create_dir(&locked).unwrap();
         let state = Arc::new(Mutex::new(State::load(&locked.join("state.json")).unwrap()));
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let tabs = Arc::new(FakeTabs::default());
+        let herdr = Arc::new(FakeHerdr::default());
         let engine = Engine::new(
             EngineSettings {
                 repo: "jaywhy13/joop".into(),
                 label: "loop".into(),
                 skill_command: "/implement".into(),
                 api_url: "http://127.0.0.1:7777".into(),
-                agent_command: vec!["pi".into()],
+                agent_kind: "claude".into(),
+                agent_args: vec!["--dangerously-skip-permissions".into()],
                 policy: HeartbeatPolicy::default(),
                 limit_threshold: 0.9,
                 max_attempts: 3,
             },
             Arc::new(FakeIssues::with(vec![issue(42)])),
             Arc::new(FakeWorktrees::default()),
-            tabs.clone(),
+            herdr.clone(),
             None,
             Arc::new(FixedClock::new(at(0))),
             state.clone(),
@@ -962,8 +1090,8 @@ mod tests {
         engine.poll().unwrap();
 
         assert_eq!(
-            *tabs.closed.lock().unwrap(),
-            vec!["1"],
+            *herdr.closed.lock().unwrap(),
+            vec!["w4:t1"],
             "an agent joop cannot supervise must not be left running, or the next poll \
              starts a second one in the same worktree"
         );
@@ -979,12 +1107,16 @@ mod tests {
     }
 
     #[test]
-    fn makes_sure_the_zellij_session_exists_before_opening_tabs() {
+    fn the_workspace_is_left_to_herdr_rather_than_ensured_separately() {
         let harness = harness(vec![issue(42)]);
 
         harness.engine.poll().unwrap();
 
-        assert_eq!(*harness.tabs.sessions_ensured.lock().unwrap(), 1);
+        assert_eq!(
+            *harness.herdr.workspaces_ensured.lock().unwrap(),
+            1,
+            "starting an agent already resolves the workspace, so joop must not ask twice"
+        );
     }
 
     #[test]
@@ -996,8 +1128,9 @@ mod tests {
         let state = harness.state.lock().unwrap();
         let session = state.session("jaywhy13/joop", 42).unwrap();
         assert_eq!(session.status, Status::Dispatched);
-        assert_eq!(session.tab_name, "issue-42");
-        assert_eq!(session.tab_id.as_deref(), Some("1"));
+        assert_eq!(session.agent_name, "issue-42");
+        assert_eq!(session.tab_id, "w4:t1");
+        assert_eq!(session.pane_id, "w4:p1");
         assert_eq!(session.branch, "joop/issue-42");
         assert_eq!(session.worktree, PathBuf::from("/worktrees/issue-42"));
         assert_eq!(session.attempts, 1);
@@ -1010,7 +1143,7 @@ mod tests {
         harness.engine.poll().unwrap();
         harness.engine.poll().unwrap();
 
-        assert_eq!(harness.tabs.opened_names(), vec!["issue-42"]);
+        assert_eq!(harness.herdr.started_names(), vec!["issue-42"]);
     }
 
     #[test]
@@ -1019,7 +1152,7 @@ mod tests {
 
         harness.engine.poll().unwrap();
 
-        let mut names = harness.tabs.opened_names();
+        let mut names = harness.herdr.started_names();
         names.sort();
         assert_eq!(names, vec!["issue-42", "issue-7"]);
     }
@@ -1032,13 +1165,13 @@ mod tests {
             .state
             .lock()
             .unwrap()
-            .record_report("jaywhy13/joop", 42, Status::Done, None, at(5))
+            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(5))
             .unwrap();
 
         harness.engine.poll().unwrap();
 
         assert_eq!(
-            harness.tabs.opened_names().len(),
+            harness.herdr.started_names().len(),
             1,
             "an open issue keeps its label after the work is done, so re-dispatching on \
              status alone would open a tab on every poll, forever"
@@ -1053,7 +1186,7 @@ mod tests {
         assert!(harness.engine.forget(42).unwrap());
         harness.engine.poll().unwrap();
 
-        assert_eq!(harness.tabs.opened_names().len(), 2);
+        assert_eq!(harness.herdr.started_names().len(), 2);
     }
 
     #[test]
@@ -1072,9 +1205,9 @@ mod tests {
         harness.engine.audit().unwrap();
 
         assert!(
-            harness.tabs.last_prompt().contains("Do the thing."),
+            harness.herdr.last_prompt().contains("Do the thing."),
             "the replacement must get the issue description, got: {}",
-            harness.tabs.last_prompt()
+            harness.herdr.last_prompt()
         );
     }
 
@@ -1090,7 +1223,7 @@ mod tests {
         }
 
         assert_eq!(
-            harness.tabs.opened_names().len(),
+            harness.herdr.started_names().len(),
             3,
             "max_attempts is 3, so joop must stop at three agents"
         );
@@ -1110,13 +1243,13 @@ mod tests {
     fn a_tab_that_cannot_be_closed_blocks_the_replacement_rather_than_doubling_up() {
         let harness = harness(vec![issue(42)]);
         harness.engine.poll().unwrap();
-        *harness.tabs.closing_fails.lock().unwrap() = true;
+        *harness.herdr.closing_fails.lock().unwrap() = true;
 
         harness.clock.advance(Duration::minutes(31));
         harness.engine.audit().unwrap();
 
         assert_eq!(
-            harness.tabs.opened_names().len(),
+            harness.herdr.started_names().len(),
             1,
             "two agents must never share one worktree"
         );
@@ -1133,30 +1266,30 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_whose_zellij_tab_has_vanished_is_replaced_without_waiting_out_its_heartbeat() {
+    fn an_agent_whose_herdr_tab_has_vanished_is_replaced_without_waiting_out_its_heartbeat() {
         let harness = harness(vec![issue(42)]);
         harness.engine.poll().unwrap();
         // The user closed the tab by hand.
-        *harness.tabs.open_names.lock().unwrap() = Some(vec![]);
+        *harness.herdr.open_labels.lock().unwrap() = Some(vec![]);
 
         harness.engine.audit().unwrap();
 
         assert_eq!(
-            harness.tabs.opened_names().len(),
+            harness.herdr.started_names().len(),
             2,
             "an agent whose tab is gone is not coming back"
         );
     }
 
     #[test]
-    fn a_zellij_that_cannot_be_queried_leaves_sessions_alone() {
+    fn a_herdr_that_cannot_be_queried_leaves_sessions_alone() {
         let harness = harness(vec![issue(42)]);
         harness.engine.poll().unwrap();
-        *harness.tabs.open_names.lock().unwrap() = Some(vec!["issue-42".into()]);
+        *harness.herdr.open_labels.lock().unwrap() = Some(vec!["issue-42".into()]);
 
         harness.engine.audit().unwrap();
 
-        assert_eq!(harness.tabs.opened_names().len(), 1);
+        assert_eq!(harness.herdr.started_names().len(), 1);
         assert_eq!(
             harness
                 .state
@@ -1181,14 +1314,15 @@ mod tests {
                 label: "loop".into(),
                 skill_command: "/implement".into(),
                 api_url: "http://127.0.0.1:7777".into(),
-                agent_command: vec!["pi".into()],
+                agent_kind: "claude".into(),
+                agent_args: vec!["--dangerously-skip-permissions".into()],
                 policy: HeartbeatPolicy::default(),
                 limit_threshold: 0.9,
                 max_attempts: 3,
             },
             Arc::new(FailingIssues),
             Arc::new(FakeWorktrees::default()),
-            Arc::new(FakeTabs::default()),
+            Arc::new(FakeHerdr::default()),
             None,
             Arc::new(FixedClock::new(at(0))),
             state,
@@ -1207,12 +1341,12 @@ mod tests {
         harness.engine.audit().unwrap();
 
         assert_eq!(
-            *harness.tabs.closed.lock().unwrap(),
-            vec!["1"],
+            *harness.herdr.closed.lock().unwrap(),
+            vec!["w4:t1"],
             "the dead agent's tab must be cleaned up"
         );
         assert_eq!(
-            harness.tabs.opened_names(),
+            harness.herdr.started_names(),
             vec!["issue-42", "issue-42"],
             "the issue must be given to another agent"
         );
@@ -1220,7 +1354,7 @@ mod tests {
         let session = state.session("jaywhy13/joop", 42).unwrap();
         assert_eq!(session.attempts, 2);
         assert_eq!(session.status, Status::Dispatched);
-        assert_eq!(session.tab_id.as_deref(), Some("2"));
+        assert_eq!(session.tab_id, "w4:t2");
     }
 
     #[test]
@@ -1232,9 +1366,9 @@ mod tests {
         harness.engine.audit().unwrap();
 
         assert!(
-            harness.tabs.last_prompt().contains("attempt 2"),
+            harness.herdr.last_prompt().contains("attempt 2"),
             "got: {}",
-            harness.tabs.last_prompt()
+            harness.herdr.last_prompt()
         );
     }
 
@@ -1246,8 +1380,8 @@ mod tests {
         harness.clock.advance(Duration::minutes(3));
         harness.engine.audit().unwrap();
 
-        assert!(harness.tabs.closed.lock().unwrap().is_empty());
-        assert_eq!(harness.tabs.opened_names().len(), 1);
+        assert!(harness.herdr.closed.lock().unwrap().is_empty());
+        assert_eq!(harness.herdr.started_names().len(), 1);
         assert_eq!(
             harness
                 .state
@@ -1278,14 +1412,15 @@ mod tests {
                     42,
                     Status::Working,
                     Some("still going"),
+                    None,
                     harness.clock.now(),
                 )
                 .unwrap();
             harness.engine.audit().unwrap();
         }
 
-        assert!(harness.tabs.closed.lock().unwrap().is_empty());
-        assert_eq!(harness.tabs.opened_names().len(), 1);
+        assert!(harness.herdr.closed.lock().unwrap().is_empty());
+        assert_eq!(harness.herdr.started_names().len(), 1);
     }
 
     #[test]
@@ -1297,7 +1432,7 @@ mod tests {
         harness.engine.poll().unwrap();
 
         assert!(
-            harness.tabs.opened_names().is_empty(),
+            harness.herdr.started_names().is_empty(),
             "joop must not start new work while out of capacity"
         );
         assert!(harness.engine.is_paused());
@@ -1325,7 +1460,7 @@ mod tests {
         harness.engine.poll().unwrap();
 
         assert!(!harness.engine.is_paused());
-        assert_eq!(harness.tabs.opened_names(), vec!["issue-42"]);
+        assert_eq!(harness.herdr.started_names(), vec!["issue-42"]);
     }
 
     #[test]
@@ -1339,15 +1474,14 @@ mod tests {
         harness.limits.set(0.05, None);
         harness.engine.check_limits().unwrap();
 
-        let lines = harness.tabs.lines.lock().unwrap().clone();
-        let mut tabs: Vec<String> = lines.iter().map(|(tab, _)| tab.clone()).collect();
-        tabs.sort();
-        assert_eq!(tabs, vec!["issue-42", "issue-7"]);
-        assert!(
-            lines[0].1.to_lowercase().contains("continue"),
-            "got: {}",
-            lines[0].1
-        );
+        let prompts = harness.herdr.prompts.lock().unwrap().clone();
+        let nudges: Vec<&(String, String)> = prompts
+            .iter()
+            .filter(|(_, text)| text.to_lowercase().contains("continue working"))
+            .collect();
+        let mut nudged: Vec<String> = nudges.iter().map(|(agent, _)| agent.clone()).collect();
+        nudged.sort();
+        assert_eq!(nudged, vec!["issue-42", "issue-7"]);
     }
 
     #[test]
@@ -1358,7 +1492,7 @@ mod tests {
             .state
             .lock()
             .unwrap()
-            .record_report("jaywhy13/joop", 42, Status::Done, None, at(1))
+            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(1))
             .unwrap();
         harness.limits.set(0.95, Some(at(60)));
         harness.engine.check_limits().unwrap();
@@ -1367,7 +1501,15 @@ mod tests {
         harness.limits.set(0.05, None);
         harness.engine.check_limits().unwrap();
 
-        assert!(harness.tabs.lines.lock().unwrap().is_empty());
+        assert!(
+            !harness
+                .herdr
+                .prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, text)| text.to_lowercase().contains("continue working"))
+        );
     }
 
     #[test]
@@ -1395,7 +1537,7 @@ mod tests {
 
         assert!(result.is_err(), "the failure is surfaced");
         assert!(!harness.engine.is_paused(), "but joop keeps working");
-        assert_eq!(harness.tabs.opened_names(), vec!["issue-42"]);
+        assert_eq!(harness.herdr.started_names(), vec!["issue-42"]);
     }
 
     #[test]
@@ -1410,7 +1552,7 @@ mod tests {
         harness.engine.audit().unwrap();
 
         assert!(
-            harness.tabs.closed.lock().unwrap().is_empty(),
+            harness.herdr.closed.lock().unwrap().is_empty(),
             "the agents are out of capacity too, so declaring them dead would close every \
              tab there is and leave nothing for the resumption message to reach"
         );
@@ -1467,58 +1609,189 @@ mod tests {
         harness.engine.audit().unwrap();
 
         assert_eq!(
-            harness.tabs.opened_names().len(),
+            harness.herdr.started_names().len(),
             2,
             "the pause buys an agent time, it does not make it immortal"
         );
     }
 
+    fn pull_request() -> PullRequest {
+        PullRequest {
+            number: 7,
+            url: "https://github.com/jaywhy13/joop/pull/7".into(),
+        }
+    }
+
     #[test]
-    fn nudging_puts_the_user_back_on_the_tab_they_were_looking_at() {
+    fn a_new_agent_gets_its_issue_shown_on_its_herdr_pane() {
+        let harness = harness(vec![issue(42)]);
+
+        harness.engine.poll().unwrap();
+
+        let metadata = harness
+            .herdr
+            .metadata_for("w4:p1")
+            .expect("metadata was pushed");
+        assert_eq!(metadata.title.as_deref(), Some("#42"));
+        assert!(metadata.tokens.contains(&("issue".into(), "42".into())));
+    }
+
+    #[test]
+    fn a_reported_pull_request_is_shown_against_the_agent_in_herdr() {
         let harness = harness(vec![issue(42)]);
         harness.engine.poll().unwrap();
-        *harness.tabs.current.lock().unwrap() = Some("my-editor".into());
-        harness.limits.set(0.95, Some(at(60)));
-        harness.engine.check_limits().unwrap();
 
-        harness.clock.advance(Duration::minutes(61));
-        harness.limits.set(0.05, None);
-        harness.engine.check_limits().unwrap();
+        harness
+            .engine
+            .record_report(
+                42,
+                Status::Review,
+                Some("opened for review"),
+                Some(pull_request()),
+            )
+            .unwrap();
 
+        let metadata = harness
+            .herdr
+            .metadata_for("w4:p1")
+            .expect("metadata was pushed");
         assert_eq!(
-            harness
-                .tabs
-                .focused
-                .lock()
-                .unwrap()
-                .last()
-                .map(String::as_str),
-            Some("my-editor"),
-            "typing into a tab means focusing it, so joop must put the focus back"
+            metadata.title.as_deref(),
+            Some("#42 · PR #7"),
+            "the pane title is where the pull request becomes visible"
+        );
+        assert!(
+            metadata
+                .tokens
+                .contains(&("pull_request".into(), "7".into()))
+        );
+        assert!(metadata.tokens.contains(&(
+            "pr_url".into(),
+            "https://github.com/jaywhy13/joop/pull/7".into()
+        )));
+        assert!(
+            metadata
+                .tokens
+                .contains(&("status".into(), "review".into()))
         );
     }
 
     #[test]
-    fn a_dead_agent_without_a_known_tab_id_is_still_replaced() {
+    fn a_reported_pull_request_is_kept_in_joops_own_state() {
         let harness = harness(vec![issue(42)]);
         harness.engine.poll().unwrap();
-        {
-            let mut state = harness.state.lock().unwrap();
-            let path = state.path().to_path_buf();
-            drop(state);
-            let mut raw: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            raw["sessions"]["jaywhy13/joop#42"]["tab_id"] = serde_json::Value::Null;
-            std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
-            state = harness.state.lock().unwrap();
-            *state = State::load(&path).unwrap();
-        }
 
-        harness.clock.advance(Duration::minutes(31));
+        harness
+            .engine
+            .record_report(42, Status::Review, None, Some(pull_request()))
+            .unwrap();
+
+        let session = harness.engine.snapshot().sessions[0].clone();
+        assert_eq!(session.pull_request, Some(pull_request()));
+        assert_eq!(session.status, Status::Review);
+    }
+
+    #[test]
+    fn a_merged_pull_request_closes_the_whole_herdr_tab() {
+        let harness = harness(vec![issue(42)]);
+        harness.engine.poll().unwrap();
+        harness
+            .engine
+            .record_report(42, Status::Review, None, Some(pull_request()))
+            .unwrap();
+
+        harness
+            .engine
+            .record_report(42, Status::Merged, None, None)
+            .unwrap();
+
+        assert_eq!(
+            *harness.herdr.closed.lock().unwrap(),
+            vec!["w4:t1"],
+            "the work has landed, so the tab has nothing left to do"
+        );
+    }
+
+    #[test]
+    fn a_merged_issue_is_not_dispatched_again_or_audited() {
+        let harness = harness(vec![issue(42)]);
+        harness.engine.poll().unwrap();
+        harness
+            .engine
+            .record_report(42, Status::Merged, None, None)
+            .unwrap();
+
+        harness.clock.advance(Duration::minutes(500));
+        harness.engine.audit().unwrap();
+        harness.engine.poll().unwrap();
+
+        assert_eq!(
+            harness.herdr.started_names().len(),
+            1,
+            "a merged issue is finished, not fair game for a new agent"
+        );
+    }
+
+    #[test]
+    fn a_working_report_does_not_close_anything() {
+        let harness = harness(vec![issue(42)]);
+        harness.engine.poll().unwrap();
+
+        harness
+            .engine
+            .record_report(42, Status::Working, Some("writing tests"), None)
+            .unwrap();
+
+        assert!(harness.herdr.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_report_for_an_issue_joop_never_dispatched_is_an_error() {
+        let harness = harness(vec![]);
+
+        assert!(
+            harness
+                .engine
+                .record_report(99, Status::Working, None, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_agent_watching_a_pull_request_goes_stale_after_five_quiet_minutes() {
+        let harness = harness(vec![issue(42)]);
+        harness.engine.poll().unwrap();
+        harness
+            .engine
+            .record_report(42, Status::Review, None, Some(pull_request()))
+            .unwrap();
+
+        harness.clock.advance(Duration::minutes(6));
         harness.engine.audit().unwrap();
 
-        assert!(harness.tabs.closed.lock().unwrap().is_empty());
-        assert_eq!(harness.tabs.opened_names().len(), 2);
+        assert_eq!(
+            harness.engine.snapshot().sessions[0].status,
+            Status::Stale,
+            "an agent told to look for reviews every five minutes is late at six"
+        );
+    }
+
+    #[test]
+    fn an_agent_still_working_is_not_held_to_the_review_rhythm() {
+        let harness = harness(vec![issue(42)]);
+        harness.engine.poll().unwrap();
+        harness
+            .engine
+            .record_report(42, Status::Working, None, None)
+            .unwrap();
+
+        harness.clock.advance(Duration::minutes(6));
+        harness.engine.audit().unwrap();
+
+        assert_eq!(
+            harness.engine.snapshot().sessions[0].status,
+            Status::Working
+        );
     }
 
     #[test]
@@ -1552,7 +1825,7 @@ mod tests {
         let pending = harness.engine.snapshot().pending;
         assert_eq!(pending.len(), 1, "a dropped issue must still be visible");
         assert_eq!(pending[0].number, 42);
-        assert!(harness.tabs.opened_names().is_empty());
+        assert!(harness.herdr.started_names().is_empty());
     }
 
     #[test]
@@ -1573,7 +1846,7 @@ mod tests {
         harness.engine.poll().unwrap();
 
         // Paused, so nothing was dispatched; the dashboard must still say why #42 is waiting.
-        assert!(harness.tabs.opened_names().is_empty());
+        assert!(harness.herdr.started_names().is_empty());
         assert!(harness.engine.snapshot().pause.is_some());
     }
 
@@ -1589,14 +1862,15 @@ mod tests {
                 label: "loop".into(),
                 skill_command: "/implement".into(),
                 api_url: "http://127.0.0.1:7777".into(),
-                agent_command: vec!["pi".into()],
+                agent_kind: "claude".into(),
+                agent_args: vec!["--dangerously-skip-permissions".into()],
                 policy: HeartbeatPolicy::default(),
                 limit_threshold: 0.9,
                 max_attempts: 3,
             },
             Arc::new(FailingIssues),
             Arc::new(FakeWorktrees::default()),
-            Arc::new(FakeTabs::default()),
+            Arc::new(FakeHerdr::default()),
             None,
             Arc::new(FixedClock::new(at(0))),
             state,

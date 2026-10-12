@@ -17,7 +17,7 @@ pub struct Briefing<'a> {
     pub attempt: u32,
 }
 
-/// Build the opening message handed to Pi.
+/// Build the opening message handed to the agent.
 pub fn build_prompt(briefing: &Briefing<'_>) -> String {
     let Briefing {
         issue,
@@ -29,11 +29,12 @@ pub fn build_prompt(briefing: &Briefing<'_>) -> String {
     } = briefing;
     let first_update_minutes = policy.first_update.num_minutes();
     let update_interval_minutes = policy.subsequent_updates.num_minutes();
+    let review_interval_minutes = policy.review_updates.num_minutes();
     let dead_after_minutes = policy.dead_after.num_minutes();
+    let number = issue.number;
 
     let mut prompt = format!(
         "{skill_command} Implement GitHub issue {repo}#{number}: {title}\n\nIssue URL: {url}",
-        number = issue.number,
         title = issue.title,
         url = issue.url,
     );
@@ -53,20 +54,35 @@ pub fn build_prompt(briefing: &Briefing<'_>) -> String {
     }
 
     prompt.push_str(&format!(
-        "\n\n---\nYou are being supervised by joop, which is tracking this issue. \
-         Reporting is mandatory:\n\
+        "\n\n---\nYou are being supervised by joop, which is tracking this issue. Reporting is \
+         mandatory.\n\
+         \n\
+         While you are working:\n\
          - Report within {first_update_minutes} minutes of starting, and then at least every \
          {update_interval_minutes} minutes.\n\
-         - If joop hears nothing for {dead_after_minutes} minutes it will close this tab and give \
-         the issue to another agent, so report before any long-running step.\n\
-         - Report by running: `joop report --issue {number} --status <status> --detail \"<what you \
-         are doing>\"`\n\
+         - Report by running: `joop report --issue {number} --status <status> --detail \"<what \
+         you are doing>\"`\n\
          - Statuses: `started` when you begin, `working` for progress, `blocked` if you need a \
-         human, `review` once a pull request is open, `done` when it is merged or finished, \
-         `failed` if you cannot continue.\n\
-         - joop's API is at {api_url} if you would rather POST to /report directly.\n\
-         Start by reporting `started`, then work the issue.\n",
-        number = issue.number,
+         human, `review` once your pull request is open, `merged` once it has landed, `failed` \
+         if you cannot continue.\n\
+         - If joop hears nothing for {dead_after_minutes} minutes it closes this tab and gives \
+         the issue to another agent, so report before any long-running step.\n\
+         \n\
+         Once you open a pull request:\n\
+         - Report it immediately, with its URL, so joop can show it against this agent:\n\
+         `joop report --issue {number} --status review --pull-request <url> --detail \"opened \
+         for review\"`\n\
+         - Then check it every {review_interval_minutes} minutes for reviews and failing \
+         checks: `gh pr view <url> --json reviewDecision,reviews,statusCheckRollup`. Address \
+         review comments and fix failing checks as you find them.\n\
+         - Report each check with `--status review`; that is also your check-in, so while a \
+         pull request is open joop expects to hear from you every {review_interval_minutes} \
+         minutes rather than every {update_interval_minutes}.\n\
+         - As soon as it is merged, report `--status merged`. joop closes this tab when you do, \
+         so make that your last action.\n\
+         \n\
+         joop's API is at {api_url} if you would rather POST to /report directly.\n\
+         Start by reporting `started`, then work the issue.\n"
     ));
 
     prompt
@@ -127,6 +143,41 @@ mod tests {
         let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
 
         assert!(!prompt.contains("Issue body:"), "got: {prompt}");
+    }
+
+    #[test]
+    fn tells_the_agent_to_report_its_pull_request_with_a_url() {
+        let issue = issue();
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
+
+        assert!(
+            prompt.contains("--status review --pull-request <url>"),
+            "joop can only show a pull request it was told about, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn tells_the_agent_to_poll_for_reviews_every_five_minutes() {
+        let issue = issue();
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
+
+        assert!(prompt.contains("every 5 minutes"), "got: {prompt}");
+        assert!(
+            prompt.contains("gh pr view"),
+            "the agent needs a way to look, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn tells_the_agent_to_report_a_merge_last_because_its_tab_closes() {
+        let issue = issue();
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
+
+        assert!(prompt.contains("--status merged"));
+        assert!(
+            prompt.contains("closes this tab"),
+            "an agent that does not know this will lose its terminal mid-sentence, got: {prompt}"
+        );
     }
 
     #[test]
