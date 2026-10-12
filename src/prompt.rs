@@ -63,8 +63,8 @@ pub fn build_prompt(briefing: &Briefing<'_>) -> String {
          - Report by running: `joop report --issue {number} --status <status> --detail \"<what \
          you are doing>\"`\n\
          - Statuses: `started` when you begin, `working` for progress, `blocked` if you need a \
-         human, `review` once your pull request is open, `merged` once it has landed, `failed` \
-         if you cannot continue.\n\
+         human, `review` once your pull request is open, `merged` once it has landed, `done` if \
+         you finished without opening one, `failed` if you cannot continue.\n\
          - If joop hears nothing for {dead_after_minutes} minutes it closes this tab and gives \
          the issue to another agent, so report before any long-running step.\n\
          \n\
@@ -77,9 +77,11 @@ pub fn build_prompt(briefing: &Briefing<'_>) -> String {
          review comments and fix failing checks as you find them.\n\
          - Report each check with `--status review`; that is also your check-in, so while a \
          pull request is open joop expects to hear from you every {review_interval_minutes} \
-         minutes rather than every {update_interval_minutes}.\n\
-         - As soon as it is merged, report `--status merged`. joop closes this tab when you do, \
-         so make that your last action.\n\
+         minutes rather than every {update_interval_minutes}. You need not repeat \
+         `--pull-request` after the first report.\n\
+         - As soon as it is merged, report `--status merged`. joop closes this tab the moment \
+         you do, which kills that command before it prints anything — that is expected, not a \
+         failure. Make it your last action.\n\
          \n\
          joop's API is at {api_url} if you would rather POST to /report directly.\n\
          Start by reporting `started`, then work the issue.\n"
@@ -165,6 +167,25 @@ mod tests {
         assert!(
             prompt.contains("gh pr view"),
             "the agent needs a way to look, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn still_tells_the_agent_how_to_finish_without_a_pull_request() {
+        let issue = issue();
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
+
+        assert!(prompt.contains("`done`"), "got: {prompt}");
+    }
+
+    #[test]
+    fn tells_the_agent_the_merged_report_will_be_killed_mid_flight() {
+        let issue = issue();
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
+
+        assert!(
+            prompt.contains("that is expected"),
+            "an agent that does not know this will read the kill as a failure, got: {prompt}"
         );
     }
 

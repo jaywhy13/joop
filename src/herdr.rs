@@ -39,10 +39,7 @@ pub struct PaneMetadata {
 
 /// The herdr session joop drives: one tab per issue, each running one agent.
 pub trait AgentHost: Send + Sync {
-    /// Find or create the workspace joop's tabs live in, returning its id.
-    fn ensure_workspace(&self) -> Result<String>;
-
-    /// Open a tab and start the agent in it.
+    /// Open a tab and start the agent in it, creating joop's workspace if it is not there yet.
     fn start(&self, spec: &AgentSpec) -> Result<RunningAgent>;
 
     /// Submit an opening prompt, or any later instruction, to a running agent.
@@ -174,8 +171,9 @@ impl<R: CommandRunner> HerdrAgents<R> {
     }
 }
 
-impl<R: CommandRunner> AgentHost for HerdrAgents<R> {
-    fn ensure_workspace(&self) -> Result<String> {
+impl<R: CommandRunner> HerdrAgents<R> {
+    /// Find or create the workspace joop's tabs live in, returning its id.
+    pub fn ensure_workspace(&self) -> Result<String> {
         if let Some(workspace_id) = self.cached_workspace_id() {
             return Ok(workspace_id);
         }
@@ -202,7 +200,9 @@ impl<R: CommandRunner> AgentHost for HerdrAgents<R> {
         self.remember_workspace_id(&created.workspace.workspace_id);
         Ok(created.workspace.workspace_id)
     }
+}
 
+impl<R: CommandRunner> AgentHost for HerdrAgents<R> {
     fn start(&self, spec: &AgentSpec) -> Result<RunningAgent> {
         let workspace_id = self.ensure_workspace()?;
 
@@ -246,7 +246,14 @@ impl<R: CommandRunner> AgentHost for HerdrAgents<R> {
             Ok(started) => started,
             Err(error) => {
                 // A tab with no agent in it is litter joop cannot supervise.
-                let _ = self.close_tab(&tab.tab.tab_id);
+                if let Err(close_error) = self.close_tab(&tab.tab.tab_id) {
+                    tracing::error!(
+                        "leaked herdr tab {}: {} failed to start and the tab would not close: \
+                         {close_error:#}",
+                        tab.tab.tab_id,
+                        spec.kind
+                    );
+                }
                 return Err(error)
                     .with_context(|| format!("could not start {} in its tab", spec.kind));
             }
@@ -314,8 +321,15 @@ impl<R: CommandRunner> AgentHost for HerdrAgents<R> {
     }
 
     fn tab_labels(&self) -> Result<Vec<String>> {
-        let Some(workspace_id) = self.cached_workspace_id().or(self.find_workspace_id()?) else {
-            return Ok(Vec::new());
+        let workspace_id = match self.cached_workspace_id() {
+            Some(workspace_id) => workspace_id,
+            None => match self.find_workspace_id()? {
+                Some(workspace_id) => {
+                    self.remember_workspace_id(&workspace_id);
+                    workspace_id
+                }
+                None => return Ok(Vec::new()),
+            },
         };
 
         let listed: TabList =
@@ -593,6 +607,33 @@ mod tests {
 
         assert!(result.is_err());
         assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn listing_tabs_reuses_the_cached_workspace_rather_than_asking_again() {
+        let runner = RecordingRunner::returning([
+            workspaces("joop"),
+            CommandOutput::succeeded(
+                r#"{"result":{"tabs":[{"tab_id":"w4:t2","label":"issue-42"}]}}"#,
+            ),
+            CommandOutput::succeeded(
+                r#"{"result":{"tabs":[{"tab_id":"w4:t2","label":"issue-42"}]}}"#,
+            ),
+        ]);
+        let agents = HerdrAgents::new(&runner, "joop");
+
+        agents.tab_labels().unwrap();
+        agents.tab_labels().unwrap();
+
+        assert_eq!(
+            runner
+                .command_lines()
+                .iter()
+                .filter(|line| line.contains("workspace list"))
+                .count(),
+            1,
+            "the audit lists tabs every thirty seconds; it must not re-resolve the workspace"
+        );
     }
 
     #[test]

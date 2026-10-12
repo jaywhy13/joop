@@ -238,7 +238,7 @@ impl Dashboard {
                     Cell::from(truncate(&session.issue_title, 34)),
                     Cell::from(session.status.as_str()).style(status_style(session.status)),
                     Cell::from(pull_request_label(session)).style(Style::new().fg(Color::Cyan)),
-                    Cell::from(tab_label(session)),
+                    Cell::from(session.tab_id.clone()),
                     Cell::from(
                         session
                             .last_update_at
@@ -266,16 +266,10 @@ impl Dashboard {
 
         let table = Table::new(
             rows,
-            [
-                Constraint::Length(7),
-                Constraint::Min(18),
-                Constraint::Length(11),
-                Constraint::Length(13),
-                Constraint::Length(12),
-                Constraint::Length(12),
-                Constraint::Length(10),
-                Constraint::Min(14),
-            ],
+            SESSION_COLUMNS
+                .iter()
+                .map(|(_, width)| *width)
+                .collect::<Vec<_>>(),
         )
         .header(header)
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
@@ -318,6 +312,19 @@ impl Dashboard {
     }
 }
 
+/// The session table's headings and widths, kept in one list so a column added to one is
+/// never missing from the other.
+const SESSION_COLUMNS: [(&str, Constraint); 8] = [
+    ("issue", Constraint::Length(7)),
+    ("title", Constraint::Min(18)),
+    ("status", Constraint::Length(11)),
+    ("pull request", Constraint::Length(13)),
+    ("tab", Constraint::Length(12)),
+    ("last update", Constraint::Length(12)),
+    ("due", Constraint::Length(10)),
+    ("latest", Constraint::Min(14)),
+];
+
 /// Labelled issues joop has seen but not handed out, so nothing is silently dropped.
 fn draw_pending(frame: &mut ratatui::Frame<'_>, area: Rect, pending: &[PendingIssue]) {
     let lines: Vec<Line<'_>> = pending
@@ -342,10 +349,6 @@ fn draw_pending(frame: &mut ratatui::Frame<'_>, area: Rect, pending: &[PendingIs
         ),
         area,
     );
-}
-
-fn tab_label(session: &Session) -> String {
-    session.tab_id.clone()
 }
 
 /// The pull request an agent reported, so the dashboard shows what is up for review.
@@ -437,10 +440,33 @@ fn restore_terminal_state() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::PullRequest;
     use chrono::{Duration, TimeZone};
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap()
+    }
+
+    fn session_with_pull_request(pull_request: Option<PullRequest>) -> Session {
+        Session {
+            repo: "jaywhy13/joop".into(),
+            issue_number: 42,
+            issue_title: "t".into(),
+            issue_url: "u".into(),
+            issue_body: String::new(),
+            agent_name: "issue-42".into(),
+            tab_id: "w4:t2".into(),
+            pane_id: "w4:p2".into(),
+            branch: "joop/issue-42".into(),
+            worktree: std::path::PathBuf::from("/worktrees/issue-42"),
+            status: Status::Review,
+            detail: None,
+            pull_request,
+            dispatched_at: now(),
+            last_update_at: None,
+            attempts: 1,
+            resumed_at: None,
+        }
     }
 
     #[test]
@@ -470,6 +496,32 @@ mod tests {
     #[test]
     fn multibyte_titles_are_cut_on_character_boundaries() {
         assert_eq!(truncate("héllo wörld", 6), "héllo…");
+    }
+
+    #[test]
+    fn every_session_column_has_a_heading_and_a_width() {
+        // A row is built from this same list, so a mismatch would shift every heading.
+        assert_eq!(SESSION_COLUMNS.len(), 8);
+        assert!(
+            SESSION_COLUMNS
+                .iter()
+                .all(|(heading, _)| !heading.is_empty())
+        );
+    }
+
+    #[test]
+    fn the_pull_request_column_shows_the_reported_number() {
+        let session = session_with_pull_request(Some(PullRequest {
+            number: 51,
+            url: None,
+        }));
+
+        assert_eq!(pull_request_label(&session), "#51");
+    }
+
+    #[test]
+    fn an_agent_with_no_pull_request_yet_shows_a_dash() {
+        assert_eq!(pull_request_label(&session_with_pull_request(None)), "—");
     }
 
     #[test]

@@ -107,14 +107,6 @@ fn handle_report(context: &ApiContext, body: &str) -> ApiResponse {
         None => None,
     };
 
-    if status == Status::Review && pull_request.is_none() {
-        return ApiResponse::error(
-            400,
-            "reporting `review` means a pull request is open, so send its number or URL as \
-             `pull_request`",
-        );
-    }
-
     match context.reporter.record_report(
         report.issue,
         status,
@@ -138,10 +130,7 @@ pub fn parse_pull_request(reported: &str) -> Result<PullRequest, String> {
         if number == 0 {
             return Err("pull request numbers start at 1".into());
         }
-        return Ok(PullRequest {
-            number,
-            url: String::new(),
-        });
+        return Ok(PullRequest { number, url: None });
     }
 
     let number = reported
@@ -156,7 +145,7 @@ pub fn parse_pull_request(reported: &str) -> Result<PullRequest, String> {
 
     Ok(PullRequest {
         number,
-        url: reported.to_string(),
+        url: Some(reported.to_string()),
     })
 }
 
@@ -317,13 +306,13 @@ mod tests {
             reports[0].pull_request,
             Some(PullRequest {
                 number: 7,
-                url: "https://github.com/jaywhy13/joop/pull/7".into()
+                url: Some("https://github.com/jaywhy13/joop/pull/7".into())
             })
         );
     }
 
     #[test]
-    fn reporting_review_without_a_pull_request_is_rejected() {
+    fn a_review_report_without_a_pull_request_is_left_for_the_engine_to_judge() {
         let reporter = accepting();
 
         let response = handle(
@@ -333,16 +322,13 @@ mod tests {
             r#"{"issue":42,"status":"review"}"#,
         );
 
-        assert_eq!(response.code, 400);
-        assert!(
-            response.body.contains("pull_request"),
-            "body: {}",
+        assert_eq!(
+            response.code, 200,
+            "an agent checking in every five minutes on a pull request joop already knows \
+             about must not be refused: {}",
             response.body
         );
-        assert!(
-            reporter.reports.lock().unwrap().is_empty(),
-            "a review with no pull request is nothing joop can show"
-        );
+        assert_eq!(reporter.reports.lock().unwrap()[0].pull_request, None);
     }
 
     #[test]
@@ -426,7 +412,7 @@ mod tests {
             parse_pull_request("7"),
             Ok(PullRequest {
                 number: 7,
-                url: String::new()
+                url: None
             })
         );
         assert_eq!(parse_pull_request("#7").unwrap().number, 7);
@@ -437,7 +423,10 @@ mod tests {
         let parsed = parse_pull_request("https://github.com/jaywhy13/joop/pull/110").unwrap();
 
         assert_eq!(parsed.number, 110);
-        assert_eq!(parsed.url, "https://github.com/jaywhy13/joop/pull/110");
+        assert_eq!(
+            parsed.url.as_deref(),
+            Some("https://github.com/jaywhy13/joop/pull/110")
+        );
     }
 
     #[test]

@@ -178,6 +178,14 @@ impl RunArgs {
                 self.update_interval
             );
         }
+        if self.dead_after <= self.review_interval {
+            bail!(
+                "--dead-after ({}m) must be longer than --review-interval ({}m), or an agent \
+                 watching a pull request dies before it can even be flagged late",
+                self.dead_after,
+                self.review_interval
+            );
+        }
 
         Ok(HeartbeatPolicy {
             first_update: Duration::minutes(self.first_update),
@@ -298,6 +306,18 @@ mod tests {
 
         assert!(
             format!("{error:#}").contains("--dead-after"),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_review_window_past_the_death_deadline_is_rejected() {
+        let error = run_args(&["--review-interval", "40", "--dead-after", "30"])
+            .policy()
+            .expect_err("an unreachable review deadline");
+
+        assert!(
+            format!("{error:#}").contains("--review-interval"),
             "got: {error:#}"
         );
     }

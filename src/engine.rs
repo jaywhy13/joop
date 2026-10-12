@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 
 use crate::clock::Clock;
@@ -348,6 +348,18 @@ impl Engine {
         detail: Option<&str>,
         pull_request: Option<PullRequest>,
     ) -> Result<()> {
+        if status == Status::Review && pull_request.is_none() {
+            let already_known = lock(&self.state)
+                .session(&self.settings.repo, issue_number)
+                .is_some_and(|session| session.pull_request.is_some());
+            if !already_known {
+                bail!(
+                    "reporting `review` means a pull request is open, so send its number or URL \
+                     as --pull-request the first time"
+                );
+            }
+        }
+
         lock(&self.state).record_report(
             &self.settings.repo,
             issue_number,
@@ -560,7 +572,10 @@ impl Engine {
         ];
         if let Some(pull_request) = pull_request {
             tokens.push(("pull_request".to_string(), pull_request.number.to_string()));
-            tokens.push(("pr_url".to_string(), pull_request.url.clone()));
+            // A pull request reported as a bare number has no URL to show.
+            if let Some(url) = &pull_request.url {
+                tokens.push(("pr_url".to_string(), url.clone()));
+            }
         }
 
         let metadata = PaneMetadata {
@@ -845,7 +860,6 @@ mod tests {
         closed: Mutex<Vec<String>>,
         focused: Mutex<Vec<String>>,
         metadata: Mutex<Vec<(String, PaneMetadata)>>,
-        workspaces_ensured: Mutex<u32>,
         next_id: Mutex<u32>,
         /// Tab labels herdr reports as open; None means "whatever was started".
         open_labels: Mutex<Option<Vec<String>>>,
@@ -886,15 +900,7 @@ mod tests {
     }
 
     impl AgentHost for FakeHerdr {
-        fn ensure_workspace(&self) -> Result<String> {
-            *self.workspaces_ensured.lock().unwrap() += 1;
-            Ok("w4".into())
-        }
-
         fn start(&self, spec: &AgentSpec) -> Result<RunningAgent> {
-            // The real adapter resolves the workspace as part of starting; model that so
-            // callers cannot quietly depend on doing it themselves.
-            self.ensure_workspace()?;
             self.started.lock().unwrap().push(spec.clone());
             let mut next = self.next_id.lock().unwrap();
             *next += 1;
@@ -1107,15 +1113,15 @@ mod tests {
     }
 
     #[test]
-    fn the_workspace_is_left_to_herdr_rather_than_ensured_separately() {
+    fn one_agent_is_started_per_dispatch() {
         let harness = harness(vec![issue(42)]);
 
         harness.engine.poll().unwrap();
 
         assert_eq!(
-            *harness.herdr.workspaces_ensured.lock().unwrap(),
+            harness.herdr.started.lock().unwrap().len(),
             1,
-            "starting an agent already resolves the workspace, so joop must not ask twice"
+            "herdr resolves its own workspace when starting, so joop makes one call"
         );
     }
 
@@ -1618,7 +1624,7 @@ mod tests {
     fn pull_request() -> PullRequest {
         PullRequest {
             number: 7,
-            url: "https://github.com/jaywhy13/joop/pull/7".into(),
+            url: Some("https://github.com/jaywhy13/joop/pull/7".into()),
         }
     }
 

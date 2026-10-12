@@ -55,11 +55,6 @@ impl Status {
         !self.is_finished() && *self != Status::Dead
     }
 
-    /// True once the agent has a pull request open and is watching it for reviews.
-    pub fn is_awaiting_review(&self) -> bool {
-        *self == Status::Review
-    }
-
     /// Statuses an agent is allowed to report.
     pub fn reportable() -> &'static [Status] {
         &[
@@ -151,7 +146,7 @@ impl HeartbeatPolicy {
     /// An agent watching a pull request is told to look for reviews every few minutes, so
     /// joop expects to hear from it on that rhythm rather than the slower working one.
     fn gap_allowed_for(&self, session: &Session) -> Duration {
-        if session.status.is_awaiting_review() {
+        if session.is_watching_a_pull_request() {
             self.review_updates
         } else {
             self.subsequent_updates
@@ -223,6 +218,13 @@ impl Session {
         self.last_heartbeat().unwrap_or_else(|| self.baseline_at())
     }
 
+    /// True while this agent has a pull request open and is polling it for reviews. Keyed on
+    /// the pull request rather than the status, because `audit` overwrites `Review` with
+    /// `Stale` on the first miss, which would silently drop the faster rhythm.
+    pub fn is_watching_a_pull_request(&self) -> bool {
+        self.pull_request.is_some() && !self.status.is_finished()
+    }
+
     /// True once joop has given up on the agent and is waiting to reassign the issue.
     pub fn needs_reassignment(&self) -> bool {
         self.status == Status::Dead
@@ -233,7 +235,9 @@ impl Session {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
-    pub url: String,
+    /// Known only when the agent reported a URL rather than a bare number.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// The facts joop records when it opens a tab for an issue.
@@ -481,7 +485,6 @@ impl State {
         session.attempts += 1;
         session.status = Status::Dispatched;
         session.detail = None;
-        session.pull_request = None;
         session.agent_name = agent_name;
         session.tab_id = tab_id;
         session.pane_id = pane_id;
@@ -1055,7 +1058,7 @@ mod tests {
     fn pull_request() -> PullRequest {
         PullRequest {
             number: 7,
-            url: "https://github.com/jaywhy13/joop/pull/7".into(),
+            url: Some("https://github.com/jaywhy13/joop/pull/7".into()),
         }
     }
 
@@ -1144,6 +1147,93 @@ mod tests {
     }
 
     #[test]
+    fn the_review_rhythm_survives_joop_overwriting_the_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 42);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Review,
+                None,
+                Some(pull_request()),
+                at(10),
+            )
+            .unwrap();
+
+        // joop itself rewrites Review to Stale on the first missed check-in.
+        state.audit(&HeartbeatPolicy::default(), at(16)).unwrap();
+        assert_eq!(
+            state.session("jaywhy13/joop", 42).unwrap().status,
+            Status::Stale
+        );
+
+        let session = state.session("jaywhy13/joop", 42).unwrap();
+        assert_eq!(
+            HeartbeatPolicy::default().deadline_for(session),
+            at(15),
+            "the agent is still polling its pull request every five minutes, so the deadline \
+             must not quietly revert to twenty just because joop relabelled the session"
+        );
+    }
+
+    #[test]
+    fn an_agent_blocked_on_a_review_keeps_the_review_rhythm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 42);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Review,
+                None,
+                Some(pull_request()),
+                at(10),
+            )
+            .unwrap();
+
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Blocked,
+                Some("waiting on a human"),
+                None,
+                at(12),
+            )
+            .unwrap();
+
+        let session = state.session("jaywhy13/joop", 42).unwrap();
+        assert_eq!(HeartbeatPolicy::default().deadline_for(session), at(17));
+    }
+
+    #[test]
+    fn a_finished_session_is_not_watching_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 42);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Status::Merged,
+                None,
+                Some(pull_request()),
+                at(10),
+            )
+            .unwrap();
+
+        assert!(
+            !state
+                .session("jaywhy13/joop", 42)
+                .unwrap()
+                .is_watching_a_pull_request()
+        );
+    }
+
+    #[test]
     fn an_agent_still_writing_code_keeps_the_slower_twenty_minute_rhythm() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::load(&state_path(&dir)).unwrap();
@@ -1186,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reassigned_issue_forgets_the_dead_agents_pull_request() {
+    fn a_reassigned_issue_inherits_the_dead_agents_pull_request() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
@@ -1215,8 +1305,9 @@ mod tests {
 
         assert_eq!(
             state.session("jaywhy13/joop", 42).unwrap().pull_request,
-            None,
-            "the replacement opens its own pull request"
+            Some(pull_request()),
+            "the replacement works the same branch, so it inherits the open pull request \
+             rather than orphaning it"
         );
     }
 
