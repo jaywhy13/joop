@@ -7,6 +7,8 @@ use crate::state::HeartbeatPolicy;
 pub struct Briefing<'a> {
     pub issue: &'a Issue,
     pub repo: &'a str,
+    /// The label that marks issues as joop's, so the agent can find related issues.
+    pub label: &'a str,
     /// Skill the agent should drive the work with, e.g. `/implement`.
     pub skill_command: &'a str,
     /// Base URL of joop's reporting API.
@@ -22,6 +24,7 @@ pub fn build_prompt(briefing: &Briefing<'_>) -> String {
     let Briefing {
         issue,
         repo,
+        label,
         skill_command,
         api_url,
         policy,
@@ -63,28 +66,48 @@ pub fn build_prompt(briefing: &Briefing<'_>) -> String {
          - Report by running: `joop report --issue {number} --status <status> --detail \"<what \
          you are doing>\"`\n\
          - Statuses: `started` when you begin, `working` for progress, `blocked` if you need a \
-         human, `review` once your pull request is open, `merged` once it has landed, `done` if \
-         you finished without opening one, `failed` if you cannot continue.\n\
+         human, `waiting` if other issues must land first (see below), `review` once your pull \
+         request is open, `merged` once it has landed, `done` if you finished without opening \
+         one, `failed` if you cannot continue.\n\
          - If joop hears nothing for {dead_after_minutes} minutes it closes this tab and gives \
          the issue to another agent, so report before any long-running step.\n\
+         \n\
+         Before you start building, check whether this issue is blocked:\n\
+         - Look for a \"Blocked by\" list in the issue body, and for work this issue plainly \
+         cannot be built without.\n\
+         - Check each issue it names with `gh issue view <number> --repo {repo} --json state,title`.\n\
+         - If any of them is still open, report `waiting` and stop, naming them: `joop report \
+         --issue {number} --status waiting --blocked-by <numbers, comma separated> --detail \
+         \"waiting on #<numbers>\"`. joop closes this tab and starts the issue again once they \
+         have landed. Make the report your last action.\n\
+         - Otherwise, carry on and build the issue.\n\
          \n\
          Once you open a pull request:\n\
          - Report it immediately, with its URL, so joop can show it against this agent:\n\
          `joop report --issue {number} --status review --pull-request <url> --detail \"opened \
          for review\"`\n\
-         - Then check it every {review_interval_minutes} minutes for reviews and failing \
-         checks: `gh pr view <url> --json reviewDecision,reviews,statusCheckRollup`. Address \
-         review comments and fix failing checks as you find them.\n\
-         - Report each check with `--status review`; that is also your check-in, so while a \
+         - Do not end your session while it is open. Keep listening for feedback: every \
+         {review_interval_minutes} minutes, check it with `gh pr view <url> --json state,\
+         reviewDecision,reviews,comments,statusCheckRollup`, and read any new review comments.\n\
+         - Address review comments and fix failing checks by pushing commits to the branch, and \
+         report each check with `--status review`. That report is also your check-in, so while a \
          pull request is open joop expects to hear from you every {review_interval_minutes} \
          minutes rather than every {update_interval_minutes}. You need not repeat \
          `--pull-request` after the first report.\n\
+         - Keep doing this until the pull request is merged or closed.\n\
+         - If it is closed without merging, report `failed` with the reason.\n\
          - As soon as it is merged, report `--status merged`. joop closes this tab the moment \
          you do, which kills that command before it prints anything — that is expected, not a \
          failure. Make it your last action.\n\
+         - If your merged work unblocks other issues, name them in the same report so joop \
+         starts them: an open issue whose \"Blocked by\" list now has only closed issues, or \
+         one that reported `waiting` on this issue. Find candidates with `gh issue list --repo \
+         {repo} --label {label} --state open --search \"#{number} in:body\"`. Name them with \
+         `--unblocks <numbers, comma separated>`, for example `joop report --issue {number} \
+         --status merged --unblocks 92,93`.\n\
          \n\
          joop's API is at {api_url} if you would rather POST to /report directly.\n\
-         Start by reporting `started`, then work the issue.\n"
+         Start by reporting `started`, then check whether the issue is blocked, then work it.\n"
     ));
 
     prompt
@@ -108,6 +131,7 @@ mod tests {
         Briefing {
             issue,
             repo: "jaywhy13/joop",
+            label: "loop",
             skill_command: "/implement",
             api_url: "http://127.0.0.1:7777",
             policy,
@@ -168,6 +192,52 @@ mod tests {
             prompt.contains("gh pr view"),
             "the agent needs a way to look, got: {prompt}"
         );
+    }
+
+    #[test]
+    fn tells_the_agent_to_check_for_blockers_before_building() {
+        let issue = issue();
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
+
+        assert!(
+            prompt.contains("Before you start building"),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("--status waiting --blocked-by"),
+            "a blocked agent needs the exact command to say so, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("gh issue view"),
+            "the agent needs a way to check its blockers, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn tells_the_agent_to_keep_listening_for_feedback_until_the_pull_request_lands() {
+        let issue = issue();
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
+
+        assert!(
+            prompt.contains("Do not end your session while it is open"),
+            "got: {prompt}"
+        );
+        assert!(
+            prompt.contains("until the pull request is merged or closed"),
+            "got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn tells_the_agent_to_name_the_issues_its_merge_unblocks() {
+        let issue = issue();
+        let prompt = build_prompt(&briefing(&issue, &HeartbeatPolicy::default(), 1));
+
+        assert!(
+            prompt.contains("--status merged --unblocks 92,93"),
+            "got: {prompt}"
+        );
+        assert!(prompt.contains("--label loop"), "got: {prompt}");
     }
 
     #[test]

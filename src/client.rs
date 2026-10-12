@@ -41,6 +41,8 @@ mod tests {
             status: "working".into(),
             detail: None,
             pull_request: None,
+            blocked_by: Vec::new(),
+            unblocks: Vec::new(),
         };
 
         // Port 1 is reserved and never listening.

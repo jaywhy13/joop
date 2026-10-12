@@ -16,7 +16,11 @@ pub enum Status {
     Dispatched,
     Started,
     Working,
+    /// The agent needs a human to decide something before it can continue.
     Blocked,
+    /// The issue cannot be started until other issues land. The agent has stopped and
+    /// joop holds the issue until those blockers clear.
+    Waiting,
     Review,
     Done,
     /// The agent's pull request has landed. joop closes its tab.
@@ -36,6 +40,7 @@ impl Status {
             Status::Started => "started",
             Status::Working => "working",
             Status::Blocked => "blocked",
+            Status::Waiting => "waiting",
             Status::Review => "review",
             Status::Done => "done",
             Status::Merged => "merged",
@@ -45,9 +50,13 @@ impl Status {
         }
     }
 
-    /// Statuses joop expects no further heartbeats from.
+    /// Statuses joop expects no further heartbeats from. A waiting agent has stopped on
+    /// purpose, so silence is expected rather than a sign that it has died.
     pub fn is_finished(&self) -> bool {
-        matches!(self, Status::Done | Status::Merged | Status::Failed)
+        matches!(
+            self,
+            Status::Done | Status::Merged | Status::Failed | Status::Waiting
+        )
     }
 
     /// True for statuses that mean an agent is still expected to be working.
@@ -61,6 +70,7 @@ impl Status {
             Status::Started,
             Status::Working,
             Status::Blocked,
+            Status::Waiting,
             Status::Review,
             Status::Done,
             Status::Merged,
@@ -98,6 +108,7 @@ impl FromStr for Status {
             "started" => Ok(Status::Started),
             "working" => Ok(Status::Working),
             "blocked" => Ok(Status::Blocked),
+            "waiting" => Ok(Status::Waiting),
             "review" => Ok(Status::Review),
             "done" => Ok(Status::Done),
             "merged" => Ok(Status::Merged),
@@ -182,6 +193,10 @@ pub struct Session {
     /// The pull request the agent opened, once it has reported one.
     #[serde(default)]
     pub pull_request: Option<PullRequest>,
+    /// Issues this one cannot start until closed, as the agent judged them. Set while the
+    /// issue is waiting.
+    #[serde(default)]
+    pub blocked_by: Vec<u64>,
     pub dispatched_at: DateTime<Utc>,
     pub last_update_at: Option<DateTime<Utc>>,
     /// How many agents have been given this issue, including the current one.
@@ -238,6 +253,17 @@ pub struct PullRequest {
     /// Known only when the agent reported a URL rather than a bare number.
     #[serde(default)]
     pub url: Option<String>,
+}
+
+/// What an agent reported, as joop records it.
+#[derive(Debug, Clone)]
+pub struct Update<'a> {
+    pub status: Status,
+    pub detail: Option<&'a str>,
+    /// The pull request, when the agent has one to report.
+    pub pull_request: Option<PullRequest>,
+    /// The issues this one is waiting on. Empty unless the status is `Waiting`.
+    pub blocked_by: Vec<u64>,
 }
 
 /// The facts joop records when it opens a tab for an issue.
@@ -338,6 +364,7 @@ impl State {
             status: Status::Dispatched,
             detail: None,
             pull_request: None,
+            blocked_by: Vec::new(),
             dispatched_at: dispatch.at,
             last_update_at: None,
             attempts: dispatch.attempt,
@@ -354,9 +381,7 @@ impl State {
         &mut self,
         repo: &str,
         issue_number: u64,
-        status: Status,
-        detail: Option<&str>,
-        pull_request: Option<PullRequest>,
+        update: Update<'_>,
         at: DateTime<Utc>,
     ) -> Result<()> {
         let id = key(repo, issue_number);
@@ -365,13 +390,14 @@ impl State {
         };
         let previous = session.clone();
 
-        session.status = status;
-        session.detail = detail.map(str::to_string);
+        session.status = update.status;
+        session.detail = update.detail.map(str::to_string);
         // An agent that reports a later status without repeating its pull request has not
         // withdrawn it, so the one joop already knows about stands.
-        if pull_request.is_some() {
-            session.pull_request = pull_request;
+        if update.pull_request.is_some() {
+            session.pull_request = update.pull_request;
         }
+        session.blocked_by = update.blocked_by;
         session.last_update_at = Some(at);
         self.persist_or_restore(&id, Some(previous))
     }
@@ -451,6 +477,15 @@ impl State {
             .collect();
         sessions.sort_by_key(|session| session.dispatched_at);
         sessions
+    }
+
+    /// Sessions whose agents stopped because other issues must land first.
+    pub fn waiting(&self) -> Vec<Session> {
+        self.sessions
+            .values()
+            .filter(|session| session.status == Status::Waiting)
+            .cloned()
+            .collect()
     }
 
     /// Give up on an issue after too many agents have died on it.
@@ -617,7 +652,17 @@ mod tests {
         // Read-only file: the write fails, the existing record must stand.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
 
-        let result = state.record_report("jaywhy13/joop", 42, Status::Done, Some("x"), None, at(1));
+        let result = state.record_report(
+            "jaywhy13/joop",
+            42,
+            Update {
+                status: Status::Done,
+                detail: Some("x"),
+                pull_request: None,
+                blocked_by: Vec::new(),
+            },
+            at(1),
+        );
 
         assert!(result.is_err());
         let session = state.session("jaywhy13/joop", 42).unwrap();
@@ -672,9 +717,12 @@ mod tests {
             .record_report(
                 "jaywhy13/joop",
                 42,
-                Status::Working,
-                Some("writing tests"),
-                None,
+                Update {
+                    status: Status::Working,
+                    detail: Some("writing tests"),
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
                 at(1),
             )
             .unwrap();
@@ -694,7 +742,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::load(&state_path(&dir)).unwrap();
 
-        let result = state.record_report("jaywhy13/joop", 99, Status::Working, None, None, at(1));
+        let result = state.record_report(
+            "jaywhy13/joop",
+            99,
+            Update {
+                status: Status::Working,
+                detail: None,
+                pull_request: None,
+                blocked_by: Vec::new(),
+            },
+            at(1),
+        );
 
         assert!(result.is_err());
     }
@@ -715,7 +773,17 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Working, None, None, at(1))
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Update {
+                    status: Status::Working,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(1),
+            )
             .unwrap();
 
         let session = state.session("jaywhy13/joop", 42).unwrap();
@@ -728,7 +796,17 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Working, None, None, at(10))
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Update {
+                    status: Status::Working,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(10),
+            )
             .unwrap();
 
         let session = state.session("jaywhy13/joop", 42).unwrap();
@@ -806,7 +884,17 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(1))
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Update {
+                    status: Status::Done,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(1),
+            )
             .unwrap();
 
         let audit = state.audit(&HeartbeatPolicy::default(), at(500)).unwrap();
@@ -826,7 +914,17 @@ mod tests {
         state.audit(&HeartbeatPolicy::default(), at(3)).unwrap();
 
         state
-            .record_report("jaywhy13/joop", 42, Status::Working, None, None, at(4))
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Update {
+                    status: Status::Working,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(4),
+            )
             .unwrap();
 
         assert_eq!(
@@ -900,7 +998,17 @@ mod tests {
         assert!(state.is_claimed("jaywhy13/joop", 42));
 
         state
-            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(1))
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Update {
+                    status: Status::Done,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(1),
+            )
             .unwrap();
 
         assert!(
@@ -937,7 +1045,17 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Working, None, None, at(5))
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Update {
+                    status: Status::Working,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(5),
+            )
             .unwrap();
 
         let resumed = state.resume_live_sessions(at(300)).unwrap();
@@ -962,7 +1080,17 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(1))
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Update {
+                    status: Status::Done,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(1),
+            )
             .unwrap();
 
         assert!(state.resume_live_sessions(at(300)).unwrap().is_empty());
@@ -991,7 +1119,17 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Done, None, None, at(1))
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Update {
+                    status: Status::Done,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(1),
+            )
             .unwrap();
 
         assert!(
@@ -1023,6 +1161,7 @@ mod tests {
             Status::Started,
             Status::Working,
             Status::Blocked,
+            Status::Waiting,
             Status::Review,
             Status::Done,
             Status::Merged,
@@ -1073,9 +1212,12 @@ mod tests {
             .record_report(
                 "jaywhy13/joop",
                 42,
-                Status::Review,
-                Some("opened a pull request"),
-                Some(pull_request()),
+                Update {
+                    status: Status::Review,
+                    detail: Some("opened a pull request"),
+                    pull_request: Some(pull_request()),
+                    blocked_by: Vec::new(),
+                },
                 at(5),
             )
             .unwrap();
@@ -1097,9 +1239,12 @@ mod tests {
             .record_report(
                 "jaywhy13/joop",
                 42,
-                Status::Review,
-                None,
-                Some(pull_request()),
+                Update {
+                    status: Status::Review,
+                    detail: None,
+                    pull_request: Some(pull_request()),
+                    blocked_by: Vec::new(),
+                },
                 at(5),
             )
             .unwrap();
@@ -1108,9 +1253,12 @@ mod tests {
             .record_report(
                 "jaywhy13/joop",
                 42,
-                Status::Review,
-                Some("no reviews yet"),
-                None,
+                Update {
+                    status: Status::Review,
+                    detail: Some("no reviews yet"),
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
                 at(10),
             )
             .unwrap();
@@ -1131,9 +1279,12 @@ mod tests {
             .record_report(
                 "jaywhy13/joop",
                 42,
-                Status::Review,
-                None,
-                Some(pull_request()),
+                Update {
+                    status: Status::Review,
+                    detail: None,
+                    pull_request: Some(pull_request()),
+                    blocked_by: Vec::new(),
+                },
                 at(10),
             )
             .unwrap();
@@ -1155,9 +1306,12 @@ mod tests {
             .record_report(
                 "jaywhy13/joop",
                 42,
-                Status::Review,
-                None,
-                Some(pull_request()),
+                Update {
+                    status: Status::Review,
+                    detail: None,
+                    pull_request: Some(pull_request()),
+                    blocked_by: Vec::new(),
+                },
                 at(10),
             )
             .unwrap();
@@ -1187,9 +1341,12 @@ mod tests {
             .record_report(
                 "jaywhy13/joop",
                 42,
-                Status::Review,
-                None,
-                Some(pull_request()),
+                Update {
+                    status: Status::Review,
+                    detail: None,
+                    pull_request: Some(pull_request()),
+                    blocked_by: Vec::new(),
+                },
                 at(10),
             )
             .unwrap();
@@ -1198,9 +1355,12 @@ mod tests {
             .record_report(
                 "jaywhy13/joop",
                 42,
-                Status::Blocked,
-                Some("waiting on a human"),
-                None,
+                Update {
+                    status: Status::Blocked,
+                    detail: Some("waiting on a human"),
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
                 at(12),
             )
             .unwrap();
@@ -1218,9 +1378,12 @@ mod tests {
             .record_report(
                 "jaywhy13/joop",
                 42,
-                Status::Merged,
-                None,
-                Some(pull_request()),
+                Update {
+                    status: Status::Merged,
+                    detail: None,
+                    pull_request: Some(pull_request()),
+                    blocked_by: Vec::new(),
+                },
                 at(10),
             )
             .unwrap();
@@ -1239,7 +1402,17 @@ mod tests {
         let mut state = State::load(&state_path(&dir)).unwrap();
         dispatched(&mut state, 42);
         state
-            .record_report("jaywhy13/joop", 42, Status::Working, None, None, at(10))
+            .record_report(
+                "jaywhy13/joop",
+                42,
+                Update {
+                    status: Status::Working,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(10),
+            )
             .unwrap();
 
         let session = state.session("jaywhy13/joop", 42).unwrap();
@@ -1256,9 +1429,12 @@ mod tests {
             .record_report(
                 "jaywhy13/joop",
                 42,
-                Status::Merged,
-                None,
-                Some(pull_request()),
+                Update {
+                    status: Status::Merged,
+                    detail: None,
+                    pull_request: Some(pull_request()),
+                    blocked_by: Vec::new(),
+                },
                 at(60),
             )
             .unwrap();
@@ -1284,9 +1460,12 @@ mod tests {
             .record_report(
                 "jaywhy13/joop",
                 42,
-                Status::Review,
-                None,
-                Some(pull_request()),
+                Update {
+                    status: Status::Review,
+                    detail: None,
+                    pull_request: Some(pull_request()),
+                    blocked_by: Vec::new(),
+                },
                 at(5),
             )
             .unwrap();
@@ -1318,6 +1497,7 @@ mod tests {
             (Status::Started, "started"),
             (Status::Working, "working"),
             (Status::Blocked, "blocked"),
+            (Status::Waiting, "waiting"),
             (Status::Review, "review"),
             (Status::Done, "done"),
             (Status::Merged, "merged"),
@@ -1330,5 +1510,106 @@ mod tests {
         }
 
         assert!("nonsense".parse::<Status>().is_err());
+    }
+
+    #[test]
+    fn a_waiting_session_is_held_without_being_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 92);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                92,
+                Update {
+                    status: Status::Waiting,
+                    detail: Some("needs #87"),
+                    pull_request: None,
+                    blocked_by: vec![87],
+                },
+                at(2),
+            )
+            .unwrap();
+
+        assert!(
+            state
+                .audit(&HeartbeatPolicy::default(), at(500))
+                .unwrap()
+                .is_empty(),
+            "an agent that stopped on purpose is not declared dead"
+        );
+        assert!(
+            state.is_claimed("jaywhy13/joop", 92),
+            "the issue stays held"
+        );
+    }
+
+    #[test]
+    fn the_waiting_sessions_and_their_blockers_are_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 92);
+        dispatched(&mut state, 93);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                92,
+                Update {
+                    status: Status::Waiting,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: vec![87, 89],
+                },
+                at(2),
+            )
+            .unwrap();
+
+        let waiting = state.waiting();
+
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].issue_number, 92);
+        assert_eq!(waiting[0].blocked_by, vec![87, 89]);
+    }
+
+    #[test]
+    fn a_later_report_replaces_the_blockers_it_no_longer_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::load(&state_path(&dir)).unwrap();
+        dispatched(&mut state, 92);
+        state
+            .record_report(
+                "jaywhy13/joop",
+                92,
+                Update {
+                    status: Status::Waiting,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: vec![87, 89],
+                },
+                at(2),
+            )
+            .unwrap();
+
+        state
+            .record_report(
+                "jaywhy13/joop",
+                92,
+                Update {
+                    status: Status::Working,
+                    detail: None,
+                    pull_request: None,
+                    blocked_by: Vec::new(),
+                },
+                at(3),
+            )
+            .unwrap();
+
+        assert!(
+            state
+                .session("jaywhy13/joop", 92)
+                .unwrap()
+                .blocked_by
+                .is_empty()
+        );
     }
 }
