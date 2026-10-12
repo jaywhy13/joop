@@ -721,10 +721,14 @@ mod tests {
     #[derive(Default)]
     struct FakeWorktrees {
         prepared: Mutex<Vec<String>>,
+        fails: Mutex<bool>,
     }
 
     impl WorktreeProvider for FakeWorktrees {
         fn prepare(&self, slug: &str, _branch: &str) -> Result<PathBuf> {
+            if *self.fails.lock().unwrap() {
+                anyhow::bail!("no space left on device");
+            }
             self.prepared.lock().unwrap().push(slug.to_string());
             Ok(self.path_for(slug))
         }
@@ -858,6 +862,7 @@ mod tests {
     struct Harness {
         engine: Engine,
         issues: Arc<FakeIssues>,
+        worktrees: Arc<FakeWorktrees>,
         tabs: Arc<FakeTabs>,
         limits: Arc<FakeLimits>,
         clock: Arc<FixedClock>,
@@ -879,6 +884,7 @@ mod tests {
         ));
         let clock = Arc::new(FixedClock::new(at(0)));
         let tabs = Arc::new(FakeTabs::default());
+        let worktrees = Arc::new(FakeWorktrees::default());
 
         let engine = Engine::new(
             EngineSettings {
@@ -892,7 +898,7 @@ mod tests {
                 max_attempts: 3,
             },
             issues.clone(),
-            Arc::new(FakeWorktrees::default()),
+            worktrees.clone(),
             tabs.clone(),
             Some(limits.clone()),
             clock.clone(),
@@ -902,6 +908,7 @@ mod tests {
         Harness {
             engine,
             issues,
+            worktrees,
             tabs,
             limits,
             clock,
@@ -1392,6 +1399,106 @@ mod tests {
     }
 
     #[test]
+    fn the_heartbeat_clock_stops_while_joop_is_paused() {
+        let harness = harness(vec![issue(42)]);
+        harness.engine.poll().unwrap();
+        harness.limits.set(0.95, Some(at(600)));
+        harness.engine.check_limits().unwrap();
+
+        // Ten times the thirty-minute death deadline.
+        harness.clock.advance(Duration::minutes(300));
+        harness.engine.audit().unwrap();
+
+        assert!(
+            harness.tabs.closed.lock().unwrap().is_empty(),
+            "the agents are out of capacity too, so declaring them dead would close every \
+             tab there is and leave nothing for the resumption message to reach"
+        );
+        assert_eq!(
+            harness
+                .state
+                .lock()
+                .unwrap()
+                .session("jaywhy13/joop", 42)
+                .unwrap()
+                .status,
+            Status::Dispatched
+        );
+    }
+
+    #[test]
+    fn a_resumed_agent_is_not_held_to_account_for_silence_it_spent_paused() {
+        let harness = harness(vec![issue(42)]);
+        harness.engine.poll().unwrap();
+        harness.limits.set(0.95, Some(at(60)));
+        harness.engine.check_limits().unwrap();
+
+        harness.clock.advance(Duration::minutes(300));
+        harness.limits.set(0.05, None);
+        harness.engine.check_limits().unwrap();
+        // One minute after being told to carry on: inside the two-minute first window.
+        harness.clock.advance(Duration::minutes(1));
+        harness.engine.audit().unwrap();
+
+        assert_eq!(
+            harness
+                .state
+                .lock()
+                .unwrap()
+                .session("jaywhy13/joop", 42)
+                .unwrap()
+                .status,
+            Status::Dispatched,
+            "the clock restarts from the resumption, not from before the pause"
+        );
+    }
+
+    #[test]
+    fn a_resumed_agent_that_stays_quiet_is_still_eventually_replaced() {
+        let harness = harness(vec![issue(42)]);
+        harness.engine.poll().unwrap();
+        harness.limits.set(0.95, Some(at(60)));
+        harness.engine.check_limits().unwrap();
+        harness.clock.advance(Duration::minutes(300));
+        harness.limits.set(0.05, None);
+        harness.engine.check_limits().unwrap();
+
+        harness.clock.advance(Duration::minutes(31));
+        harness.engine.audit().unwrap();
+
+        assert_eq!(
+            harness.tabs.opened_names().len(),
+            2,
+            "the pause buys an agent time, it does not make it immortal"
+        );
+    }
+
+    #[test]
+    fn nudging_puts_the_user_back_on_the_tab_they_were_looking_at() {
+        let harness = harness(vec![issue(42)]);
+        harness.engine.poll().unwrap();
+        *harness.tabs.current.lock().unwrap() = Some("my-editor".into());
+        harness.limits.set(0.95, Some(at(60)));
+        harness.engine.check_limits().unwrap();
+
+        harness.clock.advance(Duration::minutes(61));
+        harness.limits.set(0.05, None);
+        harness.engine.check_limits().unwrap();
+
+        assert_eq!(
+            harness
+                .tabs
+                .focused
+                .lock()
+                .unwrap()
+                .last()
+                .map(String::as_str),
+            Some("my-editor"),
+            "typing into a tab means focusing it, so joop must put the focus back"
+        );
+    }
+
+    #[test]
     fn a_dead_agent_without_a_known_tab_id_is_still_replaced() {
         let harness = harness(vec![issue(42)]);
         harness.engine.poll().unwrap();
@@ -1436,20 +1543,25 @@ mod tests {
     }
 
     #[test]
-    fn issues_that_could_not_be_started_are_shown_as_pending() {
+    fn an_issue_that_could_not_be_started_is_shown_as_waiting() {
         let harness = harness(vec![issue(42)]);
-        *harness.tabs.closing_fails.lock().unwrap() = true;
-        harness.engine.poll().unwrap();
-        harness.issues.set(vec![issue(42), issue(7)]);
+        *harness.worktrees.fails.lock().unwrap() = true;
+
         harness.engine.poll().unwrap();
 
-        // #42 is claimed; #7 is newly seen and, in this run, dispatched.
-        let snapshot = harness.engine.snapshot();
-        assert!(
-            snapshot.pending.is_empty(),
-            "both issues were started, so nothing is pending: {:?}",
-            snapshot.pending
-        );
+        let pending = harness.engine.snapshot().pending;
+        assert_eq!(pending.len(), 1, "a dropped issue must still be visible");
+        assert_eq!(pending[0].number, 42);
+        assert!(harness.tabs.opened_names().is_empty());
+    }
+
+    #[test]
+    fn an_issue_that_started_is_no_longer_shown_as_waiting() {
+        let harness = harness(vec![issue(42)]);
+
+        harness.engine.poll().unwrap();
+
+        assert!(harness.engine.snapshot().pending.is_empty());
     }
 
     #[test]
